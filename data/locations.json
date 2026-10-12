@@ -1,0 +1,47 @@
+{
+ "points": [
+  {
+   "id": "62upasanbl",
+   "name": "BCH Office",
+   "lat": 38.08744386700864,
+   "lon": -84.53319668769838
+  },
+  {
+   "id": "1gtwa2s7ih",
+   "name": "Wolf Branch Site",
+   "lat": 36.22916385572163,
+   "lon": -85.15749692916872
+  },
+  {
+   "id": "ta40n1kycn",
+   "name": "Goose Creek Site",
+   "lat": 36.67592268187053,
+   "lon": -85.56547164916994
+  },
+  {
+   "id": "m5bbpim13f",
+   "name": "Rush Branch Site",
+   "lat": 37.476111111111,
+   "lon": -85.031944444444
+  },
+  {
+   "id": "z9nny0envd",
+   "name": "Knight's Creek Site",
+   "lat": 38.434972222222,
+   "lon": -84.490055555556
+  },
+  {
+   "id": "m7qruycqda",
+   "name": "Little Trammel Site",
+   "lat": 36.602694444444,
+   "lon": -86.265111111111
+  },
+  {
+   "id": "vtzdpdu65z",
+   "name": "Flat Creek Site",
+   "lat": 36.266666666667,
+   "lon": -83.63875
+  }
+ ],
+ "areas": []
+}

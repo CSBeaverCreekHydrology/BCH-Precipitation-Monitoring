@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BCH Precipitation Monitoring</title>
+<meta name="description" content="Beaver Creek Hydrology – NWS radar-based precipitation estimates (Stage IV and MRMS) on an interactive map.">
+<meta name="theme-color" content="#1f6feb">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4C24 18 12 30 12 42a20 20 0 0 0 40 0C52 30 40 18 32 4z' fill='%231f6feb'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="css/style.css?v=1">
+</head>
+<body>
+<aside id="panel">
+  <button id="sheet-toggle" class="sheet-toggle" aria-label="Expand or collapse controls"><span></span></button>
+  <header>
+    <h1>BCH Precipitation Monitoring</h1>
+    <p class="sub">Beaver Creek Hydrology · NWS radar-based precipitation estimates</p>
+  </header>
+
+  <section class="card">
+    <form id="search" class="search" autocomplete="off">
+      <input id="search-input" placeholder="Search place, address, or lat, lon" enterkeyhint="search">
+      <button title="Search">Go</button>
+    </form>
+    <ul id="search-results" class="search-results hidden"></ul>
+  </section>
+
+  <section class="card">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-src="stage4" role="tab">Daily<span>Stage IV · 2016–now</span></button>
+      <button class="tab" data-src="mrms" role="tab">Hourly<span>MRMS · Oct 2020–now</span></button>
+    </div>
+
+    <div id="src-stage4" class="src-panel">
+      <label>Region
+        <select id="s4-region"></select>
+      </label>
+      <div class="chips" id="s4-presets">
+        <button data-p="1">Latest day</button>
+        <button data-p="3">3 days</button>
+        <button data-p="7">7 days</button>
+        <button data-p="14">14 days</button>
+        <button data-p="30">30 days</button>
+        <button data-p="mtd">Month to date</button>
+        <button data-p="wytd">Water year</button>
+        <button data-p="ytd">Year to date</button>
+      </div>
+      <div class="row2">
+        <label>First day<input type="date" id="s4-start"></label>
+        <label>Last day<input type="date" id="s4-end"></label>
+      </div>
+      <p class="note" id="s4-note">Each day is the 24 h ending 12:00 UTC on that date.</p>
+    </div>
+
+    <div id="src-mrms" class="src-panel hidden">
+      <label>Product
+        <select id="mrms-product"></select>
+      </label>
+      <div class="chips" id="mrms-presets">
+        <button data-p="1">1 h</button>
+        <button data-p="3">3 h</button>
+        <button data-p="6">6 h</button>
+        <button data-p="12">12 h</button>
+        <button data-p="24">24 h</button>
+        <button data-p="48">48 h</button>
+        <button data-p="72">72 h</button>
+      </div>
+      <div class="row2 stack">
+        <label>Start (local time)<input type="datetime-local" id="mrms-start" step="3600"></label>
+        <label>End (local time)<input type="datetime-local" id="mrms-end" step="3600"></label>
+      </div>
+      <p class="note" id="mrms-note">Checking for the latest hour…</p>
+    </div>
+
+    <div class="load-row">
+      <button id="load" class="primary">Load precipitation</button>
+      <button id="refresh" class="icon-btn" title="Re-check NWS for new data and redraw the map">↻ Refresh</button>
+    </div>
+    <div id="progress" class="progress hidden"><div></div></div>
+    <p id="status" class="status" role="status"></p>
+    <div class="refresh-row">
+      <label class="inline">Auto-refresh
+        <select id="auto-refresh">
+          <option value="0">Off</option>
+          <option value="10">Every 10 min</option>
+          <option value="30">Every 30 min</option>
+          <option value="60">Every hour</option>
+        </select>
+      </label>
+      <span class="muted" id="updated"></span>
+    </div>
+  </section>
+
+  <section class="card hidden" id="result-card">
+    <h2 id="res-title"></h2>
+    <p class="muted" id="res-product"></p>
+    <ul id="res-warnings" class="warnings"></ul>
+    <details>
+      <summary>Source files (<span id="res-nfiles"></span>)</summary>
+      <ul id="res-files" class="files"></ul>
+    </details>
+  </section>
+
+  <section class="card hidden" id="display-card">
+    <h2>Display</h2>
+    <div class="row2">
+      <label>Show
+        <select id="var">
+          <option value="obs">Observed</option>
+          <option value="normal">Normal (PRISM)</option>
+          <option value="departure">Departure from normal</option>
+          <option value="pct">Percent of normal</option>
+        </select>
+      </label>
+      <label>Color scale
+        <select id="scale">
+          <option value="auto">Auto</option>
+          <option value="hourly">Hourly (to 2.5 in)</option>
+          <option value="daily">Daily (to 10 in)</option>
+          <option value="weekly">Weekly (to 20 in)</option>
+          <option value="monthly">Monthly (to 30 in)</option>
+          <option value="seasonal">Seasonal (to 80 in)</option>
+        </select>
+      </label>
+    </div>
+    <label>Opacity <span class="muted" id="opacity-val">40%</span><input type="range" id="opacity" min="0.1" max="1" step="0.05" value="0.4"></label>
+
+    <div id="steps" class="steps hidden">
+      <div class="seg" role="radiogroup" aria-label="Map shows">
+        <button class="seg-btn active" data-mode="total">Range total</button>
+        <button class="seg-btn" data-mode="step" id="step-mode-btn">One day at a time</button>
+      </div>
+      <div id="step-controls" class="hidden">
+        <div class="step-row">
+          <button id="step-prev" class="icon-btn" title="Previous">◀</button>
+          <button id="step-play" class="icon-btn" title="Play / pause">▶</button>
+          <button id="step-next" class="icon-btn" title="Next">▶|</button>
+          <input type="range" id="step-slider" min="0" max="0" value="0" aria-label="Time step">
+        </div>
+        <p class="note" id="step-label"></p>
+      </div>
+    </div>
+
+    <div class="row2 exports">
+      <button id="export-view">GeoTIFF – map view</button>
+      <button id="export-full">GeoTIFF – full grid</button>
+    </div>
+  </section>
+
+  <section class="card hidden" id="sel-card">
+    <h2><span id="sel-title">Point</span> <span class="muted" id="sel-sub"></span></h2>
+    <table class="pt-table" id="sel-table"></table>
+    <form id="save-point" class="save-point">
+      <input id="save-name" placeholder="Name (optional)">
+      <button>Save point</button>
+    </form>
+    <button id="series-btn">Show breakdown</button>
+    <div id="chart-wrap" class="hidden">
+      <div id="chart" class="chart"></div>
+      <div class="row2">
+        <button id="csv-btn">Download CSV</button>
+        <button id="table-btn">Show table</button>
+      </div>
+      <div id="series-table" class="series-table hidden"></div>
+    </div>
+  </section>
+
+  <section class="card" id="saved-card">
+    <h2>Saved locations <span class="muted" id="saved-state"></span></h2>
+    <p class="note">Tap the map and press <b>Save point</b> (or Shift+click on a computer). Labels show the value currently mapped.</p>
+    <div class="toolbar">
+      <button id="draw-area" title="Tap corners on the map; tap the first corner or press Finish to close">✎ Draw area</button>
+      <button id="import-area-btn" title="Zipped shapefile (.shp + .prj + .dbf) or GeoJSON">Import area…</button>
+      <button id="import-pts-btn" title="CSV with name, lat, lon columns">Import points…</button>
+      <input type="file" id="import-area-file" accept=".zip,.geojson,.json,.shp,.shx,.dbf,.prj" multiple hidden>
+      <input type="file" id="import-pts-file" accept=".csv,.txt" hidden>
+    </div>
+    <div class="draw-help hidden" id="draw-help">
+      <span>Tap corners · tap the first corner, double-click or press Finish · Esc cancels</span>
+      <button id="draw-finish">Finish</button>
+    </div>
+    <ul id="saved-list" class="saved-list"></ul>
+    <p class="note" id="saved-empty">No saved points or areas yet.</p>
+    <div class="row2 saved-actions">
+      <label class="inline check"><input type="checkbox" id="show-names" checked> Show names</label>
+      <label class="inline check"><input type="checkbox" id="show-saved" checked> Show on map</label>
+    </div>
+    <div class="row2 saved-actions">
+      <button id="export-values">Values CSV</button>
+      <button id="export-breakdown">Breakdown CSV</button>
+    </div>
+    <details class="backup">
+      <summary>Backup &amp; share locations</summary>
+      <p class="note">Locations are saved in this browser on this device. Use these to move them to another device,
+        or replace <code>data/locations.json</code> in the GitHub repository to share them with everyone.</p>
+      <div class="row2">
+        <button id="export-locs">Export locations</button>
+        <button id="import-locs-btn">Import locations</button>
+      </div>
+      <input type="file" id="import-locs-file" accept=".json" hidden>
+    </details>
+  </section>
+
+  <footer>
+    Data: NOAA/NWS River Forecast Centers (Stage IV, water.noaa.gov) and NOAA/NSSL MRMS (NOAA Open Data on AWS).
+    Estimates are provisional; recent days may be revised. Search: Esri World Geocoder.
+  </footer>
+</aside>
+
+<main id="map"></main>
+<div id="hover" class="hover hidden"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script type="module" src="js/app.js?v=1"></script>
+</body>
+</html>
