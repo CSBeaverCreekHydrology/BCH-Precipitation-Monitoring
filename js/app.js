@@ -2,10 +2,11 @@
 // All data work happens in js/worker.js; grids come back as Float32Arrays and are drawn here.
 import {
   cellIndex, gridBounds, legendFor, colorOf, autoScale, autoDepScale, areaStats, areaMask,
-  labelPoint, polygonAreaKm2, geoTagsFor, colRow, VAR_LABELS,
-} from "./grid.js";
-import { writeGeoTiff } from "./decoders.js";
-import { importAreas } from "./shapes.js";
+  labelPoint, polygonAreaKm2, geoTagsFor, colRow, VAR_LABELS, areaHasPartial,
+} from "./grid.js?v=2";
+import { writeGeoTiff } from "./decoders.js?v=2";
+import { importAreas } from "./shapes.js?v=2";
+import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=2";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (t) => new Promise((r) => setTimeout(r, t));
@@ -14,7 +15,7 @@ const rid = () => Math.random().toString(36).slice(2, 12);
 const HOUR = 3600000, DAY = 86400000;
 
 // ------------------------------------------------------------------ worker RPC
-const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./worker.js?v=2", import.meta.url), { type: "module" });
 const pending = new Map();
 let callSeq = 0;
 worker.onmessage = (ev) => {
@@ -49,7 +50,7 @@ const state = {
   main: null, display: null, layer: null,
   var: prefs.var || "obs", scale: prefs.scale || "auto", opacity: prefs.opacity ?? 0.4,
   sel: null, selMarker: null, series: null,
-  lastPreset: null, steps: [], stepMode: false, stepIdx: 0, playing: false, stepToken: 0,
+  lastPreset: null, steps: [], stepMode: false, stepIdx: 0, playing: false, stepToken: 0, interval: "day",
   saved: { points: [], areas: [], removedDefaults: [] }, values: { points: [], areas: [] },
   drawing: null, fitted: !!prefs.view, autoTimer: null, lastDeleted: null,
 };
@@ -258,7 +259,7 @@ async function refreshMrmsLatest() {
   try {
     const latest = new Date(await call("mrmsLatest", [product]));
     state.mrmsLatest[product] = latest;
-    $("mrms-note").textContent = `Latest hour ends ${localTime(latest)}. Archive back to Oct 2020; ranges up to ${state.cfg.mrms_max_hours / 24} days.`;
+    $("mrms-note").textContent = `Latest hour ends ${localTime(latest)}. Archive back to Oct 2020.`;
     for (const id of ["mrms-start", "mrms-end"]) $(id).max = toLocalInput(latest);
     $("mrms-start").min = $("mrms-end").min = toLocalInput(new Date(state.cfg.mrms_earliest));
     if (!$("mrms-end").value) mrmsPreset(24);
@@ -400,6 +401,11 @@ function setMain(r) {
   $("updated").textContent = `Updated ${localTime(new Date(m.computed_utc), { hour: "numeric", minute: "2-digit" })}`;
   if (!state.fitted) { map.fitBounds(r.bounds, { padding: [10, 10] }); state.fitted = true; }
   stopPlay();
+  const ivs = intervalsFor(m);
+  if (!state.intervalChosen || !ivs.includes(state.interval)) state.interval = defaultInterval(m);
+  $("interval").innerHTML = ivs.map((iv) => `<option value="${iv}">${INTERVAL_LABELS[iv]}</option>`).join("");
+  $("interval").value = state.interval;
+  $("interval-wrap").classList.toggle("hidden", ivs.length < 2);
   buildSteps();
   resetSeries();
   if (state.stepMode && state.steps.length) showStep(Math.min(state.stepIdx, state.steps.length - 1));
@@ -409,7 +415,7 @@ function setMain(r) {
 const effVar = () => (state.display && !state.display.meta.has_normals ? "obs" : state.var);
 function effectiveScale() {
   if (state.scale !== "auto") return state.scale;
-  if (state.stepMode) return state.main.meta.step === "day" ? "daily" : "hourly";      // fixed while animating
+  if (state.stepMode) return { hour: "hourly", day: "daily", month: "monthly" }[state.interval];   // fixed while animating
   if (effVar() === "departure") return state.display.autoDepScale || "daily";
   return state.display.autoScale || "daily";
 }
@@ -447,7 +453,8 @@ function drawLegend(lg, v) {
     if (it.hi == null) return `≥ ${it.lo}${u}`;
     return `${it.lo} to ${it.hi}${u}`;
   };
-  el.innerHTML = `<div class="t" title="Show/hide legend">${esc(lg.title)} ▾</div><div class="period">${esc(periodLabel(state.display))}</div>` +
+  const gaps = state.display.meta.missing && state.display.meta.missing.length ? " * some data missing" : "";
+  el.innerHTML = `<div class="t" title="Show/hide legend">${esc(lg.title)} ▾</div><div class="period">${esc(periodLabel(state.display) + gaps)}</div>` +
     lg.items.slice().reverse().map((it) => `<div class="r"><span class="sw" style="background:${it.color}"></span>${lab(it)}</div>`).join("");
 }
 
@@ -476,29 +483,36 @@ function valueAt(r, v, k) {
   const x = v === "obs" ? o : v === "normal" ? n : v === "departure" ? o - n : n > 0.01 ? (100 * o) / n : NaN;
   return Number.isFinite(x) ? x : null;
 }
+// true when cell k has a value but some days/hours of the range had no data there
+const partialAt = (r, k) => k >= 0 && !!r.miss && r.miss[k] > 0 && r.miss[k] < r.meta.n_parts;
+const star = (p) => (p ? "*" : "");
 
 // ------------------------------------------------------------------ time steps
 const stepCache = new Map();               // key -> result (small LRU; MRMS grids are ~100 MB)
+const binLabel = (b, m) => (m.source === "stage4" && state.interval === "day" ? `24 h ending 12Z ${b.label}` : b.label) + (b.partial ? " (partial)" : "");
 function buildSteps() {
   const m = state.main.meta;
-  const steps = [];
-  if (m.source === "stage4" && m.n_steps > 1 && m.n_steps <= state.cfg.series_max_days) {
-    for (let d = parseDate(m.start); d <= parseDate(m.end); d = addDays(d, 1)) {
-      const iso = isoDate(d);
-      steps.push({ label: `24 h ending 12Z ${dayLabel(iso, true)}`, params: { source: "stage4", region: m.region, start: iso, end: iso } });
-    }
-  } else if (m.source === "mrms" && m.n_steps > 1 && m.n_steps <= state.cfg.series_max_hours) {
-    const t0 = new Date(m.start_utc).getTime();
-    for (let i = 1; i <= m.n_steps; i++) {
-      const t = new Date(t0 + i * HOUR);
-      steps.push({ label: `Hour ending ${localTime(t)}`, params: { source: "mrms", product: m.product_key, start: new Date(t - HOUR).toISOString(), end: t.toISOString() } });
-    }
-  }
-  state.steps = steps;
-  $("steps").classList.toggle("hidden", !steps.length);
-  $("step-mode-btn").textContent = m.step === "day" ? "One day at a time" : "One hour at a time";
-  $("step-slider").max = Math.max(0, steps.length - 1);
+  const bins = m.n_steps > 1 ? makeBins(m, state.interval) : [];
+  state.steps = bins.length > 1 ? bins.map((b) => ({
+    label: binLabel(b, m),
+    params: m.source === "stage4" ? { source: "stage4", region: m.region, start: b.start, end: b.end }
+      : { source: "mrms", product: m.product_key, start: b.start, end: b.end },
+  })) : [];
+  $("steps").classList.toggle("hidden", !state.steps.length);
+  $("step-mode-btn").textContent = `One ${state.interval} at a time`;
+  $("step-slider").max = Math.max(0, state.steps.length - 1);
 }
+
+$("interval").addEventListener("change", () => {
+  state.interval = $("interval").value;
+  state.intervalChosen = true;
+  stopPlay();
+  buildSteps();
+  resetSeries();
+  state.stepIdx = 0;
+  if (state.stepMode) showStep(0);
+  refreshSelection();
+});
 
 function getStep(i) {
   const params = state.steps[i].params;
@@ -604,8 +618,9 @@ map.on("mousemove", (ev) => {
   hoverRaf = requestAnimationFrame(() => {
     hoverRaf = 0;
     const d = state.display, v = effVar();
-    const x = valueAt(d, v, cellIndex(d.grid, ev.latlng.lat, ev.latlng.lng));
-    hover.textContent = x == null ? "no data" : fmtVal(x, v);
+    const k = cellIndex(d.grid, ev.latlng.lat, ev.latlng.lng);
+    const x = valueAt(d, v, k);
+    hover.textContent = x == null ? "no data" : `${fmtVal(x, v)}${partialAt(d, k) ? " * some data missing" : ""}`;
     hover.style.left = `${ev.originalEvent.clientX + 14}px`;
     hover.style.top = `${ev.originalEvent.clientY + 12}px`;
     hover.classList.remove("hidden");
@@ -671,13 +686,34 @@ function areaValues(r, area) {
   const m = maskFor(r, area);
   const o = areaStats(r.obs, m);
   if (!o) return null;
-  const out = { obs: o };
+  const out = { obs: o, partial: !!r.miss && areaHasPartial(r.miss, m, r.meta.n_parts) };
   if (r.normal) {
     const n = areaStats(r.normal, m);
     if (n) { out.normal = n; out.departure = { mean: o.mean - n.mean }; out.pct = { mean: n.mean > 0.01 ? (100 * o.mean) / n.mean : NaN }; }
   }
   return out;
 }
+
+// Which days/hours had no data at a location (only computed for locations marked with *).
+const missCache = new Map();
+function missingFor(r, pts, ars) {
+  const key = `${r.id}|${JSON.stringify(pts)}|${ars.length ? JSON.stringify(ars).length + JSON.stringify(ars).slice(0, 200) : ""}`;
+  if (!missCache.has(key)) {
+    // shortcut: a point missing exactly the files missing everywhere needs no extra reading
+    if (pts.length === 1 && !ars.length) {
+      const k = cellIndex(r.grid, pts[0].lat, pts[0].lon);
+      if (k >= 0 && r.miss[k] === r.meta.missing.length) missCache.set(key, Promise.resolve([r.meta.missing]));
+    }
+    if (!missCache.has(key)) {
+      const p = call("series", [r.meta, pts, ars, "total"]).then((j) => [...j.points, ...j.areas].map((x) => x[0].m));
+      p.catch(() => missCache.delete(key));
+      missCache.set(key, p);
+    }
+    if (missCache.size > 200) missCache.delete(missCache.keys().next().value);
+  }
+  return missCache.get(key);
+}
+const listText = (arr, max = 12) => (arr.length ? arr.slice(0, max).join("; ") + (arr.length > max ? `; +${arr.length - max} more` : "") : "");
 
 function refreshSelection() {
   const s = state.sel;
@@ -687,13 +723,16 @@ function refreshSelection() {
   $("save-point").classList.toggle("hidden", s.kind !== "point" || !!s.id);
   const d = state.display;
   const rows = [];
+  let partial = false, payload = null;
   if (s.kind === "point") {
     $("sel-sub").textContent = llText(s.lat, s.lon);
     if (d) {
       const k = cellIndex(d.grid, s.lat, s.lon);
       const o = valueAt(d, "obs", k);
-      rows.push(["Precipitation", o == null ? "no data" : `${fmtIn(o)} (${(o * 25.4).toFixed(1)} mm)`]);
-      if (d.meta.has_normals) rows.push(["Normal", fmtVal(valueAt(d, "normal", k), "normal")], ["Departure", fmtVal(valueAt(d, "departure", k), "departure")], ["% of normal", fmtVal(valueAt(d, "pct", k), "pct")]);
+      partial = partialAt(d, k);
+      payload = [[{ lat: s.lat, lon: s.lon }], []];
+      rows.push(["Precipitation", o == null ? "no data" : `${fmtIn(o)}${star(partial)} (${(o * 25.4).toFixed(1)} mm)`]);
+      if (d.meta.has_normals) rows.push(["Normal", fmtVal(valueAt(d, "normal", k), "normal")], ["Departure", fmtVal(valueAt(d, "departure", k), "departure") + star(partial)], ["% of normal", fmtVal(valueAt(d, "pct", k), "pct") + star(partial)]);
     }
   } else {
     const a = state.saved.areas.find((x) => x.id === s.id);
@@ -703,22 +742,30 @@ function refreshSelection() {
       const v = areaValues(d, a);
       if (!v) rows.push(["Precipitation", "no data in this area"]);
       else {
-        rows.push(["Area average", `${fmtIn(v.obs.mean)} (${(v.obs.mean * 25.4).toFixed(1)} mm)`],
+        partial = v.partial;
+        payload = [[], [a.geometry]];
+        rows.push(["Area average", `${fmtIn(v.obs.mean)}${star(partial)} (${(v.obs.mean * 25.4).toFixed(1)} mm)`],
           ["Max / min cell", `${fmtIn(v.obs.max)} / ${fmtIn(v.obs.min)}`],
           ["Grid cells", `${v.obs.cells}${v.obs.coverage < 1 ? ` (${Math.round(v.obs.coverage * 100)}% with data)` : ""}`]);
-        if (d.meta.has_normals && v.normal) rows.push(["Normal (avg)", fmtVal(v.normal.mean, "normal")], ["Departure (avg)", fmtVal(v.departure.mean, "departure")], ["% of normal", fmtVal(v.pct.mean, "pct")]);
+        if (d.meta.has_normals && v.normal) rows.push(["Normal (avg)", fmtVal(v.normal.mean, "normal")], ["Departure (avg)", fmtVal(v.departure.mean, "departure") + star(partial)], ["% of normal", fmtVal(v.pct.mean, "pct") + star(partial)]);
       }
     }
   }
   if (d) rows.unshift(["Period", esc(periodLabel(d))]);
+  if (partial) rows.push(["* Missing data", `<span id="sel-missing" class="missing-list">checking which ${d.meta.step === "day" ? "days" : "hours"}…</span>`]);
   $("sel-table").innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  if (partial) {
+    const sel = s;
+    missingFor(d, ...payload).then(([list]) => {
+      if (state.sel !== sel || !$("sel-missing")) return;
+      $("sel-missing").textContent = `Total includes only the data available. No data for: ${listText(list) || "part of the period"}`;
+    }).catch((e) => { if ($("sel-missing")) $("sel-missing").textContent = `Some data missing (${e.message})`; });
+  }
   if (!state.main) { $("series-btn").classList.add("hidden"); return; }
   $("series-btn").classList.remove("hidden");
-  const m = state.main.meta;
-  const tooLong = (m.step === "day" && m.n_steps > state.cfg.series_max_days) || (m.step === "hour" && m.n_steps > state.cfg.series_max_hours);
-  $("series-btn").disabled = tooLong;
-  $("series-btn").textContent = (m.step === "day" ? `Show daily breakdown (${m.n_steps} days)` : `Show hourly breakdown (${m.n_steps} h)`) +
-    (s.kind === "area" ? " – area average" : "") + (tooLong ? " – range too long" : "");
+  const nb = makeBins(state.main.meta, state.interval).length;
+  const unit = { hour: "hour", day: "day", month: "month" }[state.interval];
+  $("series-btn").textContent = `Show ${INTERVAL_LABELS[state.interval].toLowerCase()} breakdown (${nb} ${unit}${nb > 1 ? "s" : ""})` + (s.kind === "area" ? " – area average" : "");
 }
 
 $("save-point").addEventListener("submit", (ev) => {
@@ -751,9 +798,9 @@ $("series-btn").addEventListener("click", async () => {
   try {
     const sel = state.sel;
     const [pts, ars] = selGeomPayload();
-    const j = await call("series", [state.main.meta, pts, ars], (p) => { btn.textContent = `${p.message}…`; });
+    const j = await call("series", [state.main.meta, pts, ars, state.interval], (p) => { btn.textContent = `${p.message}…`; });
     if (state.sel !== sel) return;
-    state.series = { step: j.step, times: j.times, vals: sel.kind === "point" ? j.points[0] : j.areas[0], name: selName() };
+    state.series = { interval: j.interval, bins: j.bins, vals: sel.kind === "point" ? j.points[0] : j.areas[0], name: selName() };
     $("chart-wrap").classList.remove("hidden");
     drawChart();
     buildTable();
@@ -765,11 +812,13 @@ $("series-btn").addEventListener("click", async () => {
   }
 });
 
-function stepLabel(t, step, long) {
-  if (step === "day") return dayLabel(t.t, long);
-  const d = new Date(t.end_utc);
-  return long ? localTime(d) : d.toLocaleTimeString(undefined, { hour: "numeric" });
+// short axis label for a bin
+function shortLabel(b, interval) {
+  if (interval === "hour") return new Date(b.end).toLocaleTimeString(undefined, { hour: "numeric" });
+  if (interval === "month") return b.label;
+  return b.label.replace(/, \d{4}$/, "");
 }
+const longLabel = (b, interval) => (state.main.meta.source === "stage4" && interval === "day" ? `24 h ending 12Z ${b.label}` : b.label) + (b.partial ? " (partial period)" : "");
 function niceMax(v) {
   if (!(v > 0)) return 0.1;
   const p = Math.pow(10, Math.floor(Math.log10(v)));
@@ -778,26 +827,31 @@ function niceMax(v) {
 }
 
 function drawChart() {
-  const { times, vals, step } = state.series;
-  const total = vals.reduce((a, v) => a + (v || 0), 0);
-  const nMissing = vals.filter((v) => v == null).length;
+  const { bins, vals, interval } = state.series;
+  const nums = vals.map((x) => x.v);
+  const total = nums.reduce((a, v) => a + (v || 0), 0);
+  const nNone = vals.filter((x) => x.v == null).length;
+  const nPart = vals.filter((x) => x.v != null && x.m.length).length;
   const W = 330, H = 170, ml = 34, mr = 6, mt = 22, mb = 22;
   const pw = W - ml - mr, ph = H - mt - mb;
-  const ymax = niceMax(Math.max(...vals.map((v) => v || 0)));
+  const ymax = niceMax(Math.max(...nums.map((v) => v || 0)));
   const bw = pw / vals.length, gap = Math.min(2, bw * 0.25);
   const y = (v) => mt + ph - (v / ymax) * ph;
-  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Precipitation per ${step}">`;
-  s += `<text x="${ml}" y="13" font-size="11.5" fill="var(--ink-2)">Total ${fmtIn(total)} · per ${step}${nMissing ? ` · ${nMissing} missing` : ""}</text>`;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Precipitation per ${interval}">`;
+  s += `<text x="${ml}" y="13" font-size="11.5" fill="var(--ink-2)">Total ${fmtIn(total)}${nNone || nPart ? "*" : ""} · per ${interval}${nNone ? ` · ${nNone} with no data` : ""}</text>`;
   for (const t of [0, ymax / 2, ymax]) {
     s += `<line x1="${ml}" x2="${W - mr}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)" />`;
     s += `<text x="${ml - 4}" y="${y(t) + 3.5}" font-size="10" text-anchor="end" fill="var(--muted)">${+t.toFixed(2)}</text>`;
   }
-  vals.forEach((v, i) => {
+  vals.forEach(({ v, m }, i) => {
     const x = ml + i * bw + gap / 2, w = Math.max(1, bw - gap);
     if (v == null) s += `<text x="${x + w / 2}" y="${mt + ph - 2}" font-size="9" text-anchor="middle" fill="var(--muted)">×</text>`;
-    else if (v > 0) {
-      const h = Math.max(1, mt + ph - y(v)), r = Math.min(4, w / 2, h);
-      s += `<path class="bar" data-i="${i}" d="M${x},${mt + ph} V${mt + ph - h + r} Q${x},${mt + ph - h} ${x + r},${mt + ph - h} H${x + w - r} Q${x + w},${mt + ph - h} ${x + w},${mt + ph - h + r} V${mt + ph} Z" fill="var(--bar)" />`;
+    else {
+      if (v > 0) {
+        const h = Math.max(1, mt + ph - y(v)), r = Math.min(4, w / 2, h);
+        s += `<path class="bar" data-i="${i}" d="M${x},${mt + ph} V${mt + ph - h + r} Q${x},${mt + ph - h} ${x + r},${mt + ph - h} H${x + w - r} Q${x + w},${mt + ph - h} ${x + w},${mt + ph - h + r} V${mt + ph} Z" fill="var(--bar)"${m.length ? ' fill-opacity="0.5"' : ""} />`;
+      }
+      if (m.length && bw >= 5) s += `<text x="${x + w / 2}" y="${Math.min(y(v), mt + ph) - 2}" font-size="10" text-anchor="middle" fill="var(--ink-2)">*</text>`;
     }
     s += `<rect class="hit" data-i="${i}" x="${ml + i * bw}" y="${mt}" width="${bw}" height="${ph}" fill="transparent" style="cursor:pointer" />`;
   });
@@ -806,9 +860,13 @@ function drawChart() {
   for (const i of [...new Set([0, Math.floor((vals.length - 1) / 2), vals.length - 1])]) {
     const anchor = i === 0 ? "start" : i === vals.length - 1 ? "end" : "middle";
     const x = i === 0 ? ml : i === vals.length - 1 ? W - mr : ml + (i + 0.5) * bw;
-    s += `<text x="${x}" y="${H - 6}" font-size="10" text-anchor="${anchor}" fill="var(--muted)">${stepLabel(times[i], step)}</text>`;
+    s += `<text x="${x}" y="${H - 6}" font-size="10" text-anchor="${anchor}" fill="var(--muted)">${esc(shortLabel(bins[i], interval))}</text>`;
   }
   s += `<text x="4" y="${mt + 2}" font-size="10" fill="var(--muted)">in</text></svg><div class="tip hidden"></div>`;
+  if (nNone || nPart) {
+    const what = state.main.meta.step === "day" ? "days" : "hours";
+    s += `<p class="note">* Some ${what} have no data here${nPart ? `; faded bars show the ${what} that do` : ""}${nNone ? "; × = no data at all" : ""}. Hover a bar or open the table for details.</p>`;
+  }
   const el = $("chart");
   el.innerHTML = s;
   el.dataset.bw = bw; el.dataset.ml = ml;
@@ -819,7 +877,8 @@ function drawChart() {
     r.addEventListener("mouseenter", () => {
       paint(i);
       const box = svg.getBoundingClientRect(), sc = box.width / W;
-      tip.textContent = `${step === "day" ? "24 h ending 12Z " : "Hour ending "}${stepLabel(times[i], step, true)}: ${vals[i] == null ? "no data" : fmtIn(vals[i])}`;
+      const { v, m } = vals[i];
+      tip.textContent = `${longLabel(bins[i], interval)}: ${v == null ? "no data" : fmtIn(v)}${m.length && v != null ? ` * no data for ${listText(m, 3)}` : ""}`;
       tip.style.left = `${Math.min(Math.max((ml + (i + 0.5) * bw) * sc, 90), box.width - 90)}px`;
       tip.style.top = `${mt * sc}px`;
       tip.classList.remove("hidden");
@@ -845,13 +904,15 @@ function highlightChart() {
 }
 
 function buildTable() {
-  const { times, vals, step } = state.series;
+  const { bins, vals, interval } = state.series;
   let cum = 0;
-  const rows = vals.map((v, i) => {
+  const rows = vals.map(({ v, m }, i) => {
     cum += v || 0;
-    return `<tr data-i="${i}"><td>${stepLabel(times[i], step, true)}</td><td>${v == null ? "—" : v.toFixed(2)}</td><td>${cum.toFixed(2)}</td></tr>`;
+    return `<tr data-i="${i}"><td>${esc(longLabel(bins[i], interval))}</td><td>${v == null ? "—" : v.toFixed(2) + star(m.length)}</td><td>${cum.toFixed(2)}</td>` +
+      `<td class="miss-cell">${m.length ? esc(listText(m, 6)) : ""}</td></tr>`;
   }).join("");
-  $("series-table").innerHTML = `<table><tr><th>${step === "day" ? "Day (24 h ending 12Z)" : "Hour ending (local)"}</th><th>in</th><th>cum. in</th></tr>${rows}</table>`;
+  const head = { hour: "Hour ending (local)", day: state.main.meta.source === "stage4" ? "Day (24 h ending 12Z)" : "Day (local)", month: "Month" }[interval];
+  $("series-table").innerHTML = `<table><tr><th>${head}</th><th>in</th><th>cum. in</th><th>* no data for</th></tr>${rows}</table>`;
   highlightChart();
 }
 
@@ -866,8 +927,15 @@ $("csv-btn").addEventListener("click", () => {
   const m = state.main.meta, s = state.sel;
   let cum = 0;
   const where = s.kind === "point" ? `point lat,lon = ${s.lat.toFixed(5)},${s.lon.toFixed(5)}` : `area average over "${selName()}"`;
-  const lines = [`# ${m.product}`, `# ${m.label}`, `# ${state.series.name}: ${where}`, "period_end_utc,precip_in,cumulative_in",
-    ...state.series.vals.map((v, i) => { cum += v || 0; return `${state.series.times[i].end_utc},${v == null ? "" : v.toFixed(3)},${cum.toFixed(3)}`; })];
+  const { bins, vals, interval } = state.series;
+  const lines = [`# ${m.product}`, `# ${m.label}`, `# ${state.series.name}: ${where}`,
+    `# precipitation in inches per ${interval}; values include only the data available (complete = no)`,
+    "period,period_start_utc,period_end_utc,precip_in,cumulative_in,complete,missing_data",
+    ...vals.map(({ v, m: miss }, i) => {
+      cum += v || 0;
+      return [csvCell(bins[i].label + (bins[i].partial ? " (partial period)" : "")), bins[i].start_utc, bins[i].end_utc,
+        v == null ? "" : v.toFixed(3), cum.toFixed(3), miss.length ? "no" : "yes", csvCell(miss.join("; "))].join(",");
+    })];
   const tag = s.kind === "point" ? `${s.lat.toFixed(4)}_${s.lon.toFixed(4)}` : selName().replace(/[^\w-]+/g, "_");
   downloadText(lines.join("\r\n"), `precip_${tag}_${m.source}.csv`);
 });
@@ -946,6 +1014,14 @@ function savedValue(kind, i) {
   if (kind === "points") return v[vr] ?? null;
   return v[vr] ? (Number.isFinite(v[vr].mean) ? v[vr].mean : null) : null;
 }
+const savedPartial = (kind, i) => !!((state.values[kind] || [])[i] || {}).partial;
+// "1.23 in*" / "1.23 in avg*" / "no data"
+function savedText(kind, i) {
+  if (!state.display) return "";
+  const v = savedValue(kind, i);
+  if (v == null) return "no data";
+  return `${fmtVal(v, effVar())}${kind === "areas" ? " avg" : ""}${star(savedPartial(kind, i))}`;
+}
 
 function refreshSavedValues() {
   const d = state.display;
@@ -954,7 +1030,7 @@ function refreshSavedValues() {
   state.values = {
     points: state.saved.points.map((p) => {
       const k = cellIndex(d.grid, p.lat, p.lon);
-      return Object.fromEntries(vars.map((v) => [v, valueAt(d, v, k)]));
+      return { ...Object.fromEntries(vars.map((v) => [v, valueAt(d, v, k)])), partial: partialAt(d, k) };
     }),
     areas: state.saved.areas.map((a) => { try { return areaValues(d, a); } catch (_) { return null; } }),
   };
@@ -962,26 +1038,25 @@ function refreshSavedValues() {
 }
 
 function updateSavedLabels() {
-  const names = $("show-names").checked, vr = effVar(), sel = state.sel;
+  const names = $("show-names").checked, sel = state.sel;
+  const tip = (name, kind, i) => esc(name) + (savedPartial(kind, i) ? " – * some data missing; click for details" : "");
   state.saved.points.forEach((p, i) => {
     const mk = markerById.get(p.id);
     if (!mk) return;
-    const v = savedValue("points", i);
     const isSel = sel && sel.kind === "point" && sel.id === p.id;
     mk.setIcon(L.divIcon({
       className: "sp-icon", iconSize: [0, 0],
-      html: `<div class="sp${names ? "" : " nonames"}${isSel ? " sel" : ""}" title="${esc(p.name)}"><div class="sp-name">${esc(p.name)}</div>` +
-        `<div class="sp-val">${state.display ? (v == null ? "n/a" : fmtVal(v, vr)) : ""}</div><div class="sp-dot"></div></div>`,
+      html: `<div class="sp${names ? "" : " nonames"}${isSel ? " sel" : ""}" title="${tip(p.name, "points", i)}"><div class="sp-name">${esc(p.name)}</div>` +
+        `<div class="sp-val">${savedText("points", i)}</div><div class="sp-dot"></div></div>`,
     }));
   });
   state.saved.areas.forEach((a, i) => {
     const mk = markerById.get(a.id);
     if (!mk) return;
-    const v = savedValue("areas", i);
     mk.setIcon(L.divIcon({
       className: "sp-icon", iconSize: [0, 0],
-      html: `<div class="sp area${names ? "" : " nonames"}" title="${esc(a.name)}"><div class="sp-name">${esc(a.name)}</div>` +
-        `<div class="sp-val">${state.display ? (v == null ? "n/a" : `${fmtVal(v, vr)} avg`) : ""}</div></div>`,
+      html: `<div class="sp area${names ? "" : " nonames"}" title="${tip(a.name, "areas", i)}"><div class="sp-name">${esc(a.name)}</div>` +
+        `<div class="sp-val">${savedText("areas", i)}</div></div>`,
     }));
   });
   renderSavedList();
@@ -989,29 +1064,50 @@ function updateSavedLabels() {
 
 function renderSavedList() {
   const ul = $("saved-list");
-  if (ul.querySelector("input")) return;          // a rename is open; it re-renders when done
-  const vr = effVar(), sel = state.sel;
+  if (ul.querySelector("input.rename")) return;      // a rename is open; it re-renders when done
+  const sel = state.sel;
   const row = (kind, item, i) => {
-    const v = savedValue(kind, i);
     const isSel = sel && ((kind === "points" && sel.kind === "point" && sel.id === item.id) || (kind === "areas" && sel.kind === "area" && sel.id === item.id));
     return `<li data-kind="${kind}" data-id="${item.id}"${isSel ? ' class="sel"' : ""}>` +
+      `<input type="checkbox" class="inc" data-act="inc" title="Include in Values / Breakdown CSV"${item.off ? "" : " checked"}>` +
       `<span class="ico" title="${kind === "points" ? "Point" : "Area"}">${kind === "points" ? "●" : "▱"}</span>` +
       `<span class="nm" title="Zoom to ${esc(item.name)}">${esc(item.name)}</span>` +
-      `<span class="val">${state.display ? (v == null ? "—" : fmtVal(v, vr) + (kind === "areas" ? " avg" : "")) : ""}</span>` +
+      `<span class="val"${savedPartial(kind, i) ? ' title="* some data missing in this period; click the location for details"' : ""}>${savedText(kind, i)}</span>` +
       `<button class="act" data-act="rename" title="Rename">✎</button><button class="act" data-act="delete" title="Delete">✕</button></li>`;
   };
   ul.innerHTML = state.saved.points.map((p, i) => row("points", p, i)).join("") + state.saved.areas.map((a, i) => row("areas", a, i)).join("");
-  $("saved-empty").classList.toggle("hidden", state.saved.points.length + state.saved.areas.length > 0);
+  const total = state.saved.points.length + state.saved.areas.length;
+  $("saved-empty").classList.toggle("hidden", total > 0);
+  $("inc-row").classList.toggle("hidden", !total);
+  $("inc-count").textContent = `${checkedLocations().count} of ${total} selected for CSV`;
 }
+
+const checkedLocations = () => {
+  const points = state.saved.points.map((p, i) => ({ item: p, i })).filter((x) => !x.item.off);
+  const areas = state.saved.areas.map((a, i) => ({ item: a, i })).filter((x) => !x.item.off);
+  return { points, areas, count: points.length + areas.length };
+};
+function setAllIncluded(on) {
+  for (const x of [...state.saved.points, ...state.saved.areas]) { if (on) delete x.off; else x.off = true; }
+  persistSaved(); renderSavedList();
+}
+$("inc-all").addEventListener("click", () => setAllIncluded(true));
+$("inc-none").addEventListener("click", () => setAllIncluded(false));
 
 $("saved-list").addEventListener("click", (ev) => {
   const li = ev.target.closest("li");
-  if (!li || li.querySelector("input")) return;
+  if (!li || li.querySelector("input.rename")) return;
   const kind = li.dataset.kind, id = li.dataset.id;
   const list = state.saved[kind];
   const item = list.find((x) => x.id === id);
   if (!item) return;
   const act = ev.target.dataset.act;
+  if (act === "inc") {
+    if (ev.target.checked) delete item.off; else item.off = true;
+    persistSaved();
+    $("inc-count").textContent = `${checkedLocations().count} of ${state.saved.points.length + state.saved.areas.length} selected for CSV`;
+    return;
+  }
   if (act === "delete") {
     const idx = list.indexOf(item);
     list.splice(idx, 1);
@@ -1043,6 +1139,7 @@ $("saved-list").addEventListener("click", (ev) => {
 function startRename(li, item) {
   const nm = li.querySelector(".nm");
   const input = document.createElement("input");
+  input.className = "rename";
   input.value = item.name;
   nm.replaceWith(input);
   input.focus(); input.select();
@@ -1067,41 +1164,69 @@ function renameById(id) {
 $("show-names").addEventListener("change", () => { prefs.showNames = $("show-names").checked; savePrefs(); updateSavedLabels(); });
 $("show-saved").addEventListener("change", () => { prefs.showSaved = $("show-saved").checked; savePrefs(); renderSaved(); });
 
-$("export-values").addEventListener("click", () => {
+$("export-values").addEventListener("click", async () => {
   const d = state.display;
   if (!d) return;
+  const sel = checkedLocations();
+  if (!sel.count) return setStatus("Tick at least one saved location (checkbox on the left) to export.", true);
   const v = state.values, hasN = d.meta.has_normals;
-  const f = (x, n = 3) => (x == null || !Number.isFinite(x) ? "" : x.toFixed(n));
-  const lines = [`# ${d.meta.product}`, `# ${periodLabel(d)}${d.meta.source === "stage4" ? " (days end 12:00 UTC)" : ""}`,
-    ["type", "name", "lat", "lon", "area_km2", "precip_in", "max_in", "min_in", ...(hasN ? ["normal_in", "departure_in", "pct_of_normal"] : [])].join(",")];
-  state.saved.points.forEach((p, i) => {
-    const s = v.points[i] || {};
-    lines.push(["point", csvCell(p.name), p.lat.toFixed(5), p.lon.toFixed(5), "", f(s.obs), "", "", ...(hasN ? [f(s.normal), f(s.departure), f(s.pct, 1)] : [])].join(","));
-  });
-  state.saved.areas.forEach((a, i) => {
-    const s = v.areas[i] || {};
-    const c = labelPoint(a.geometry);
-    lines.push(["area", csvCell(a.name), c[0].toFixed(5), c[1].toFixed(5), a.area_km2.toFixed(2), f(s.obs && s.obs.mean), f(s.obs && s.obs.max), f(s.obs && s.obs.min),
-      ...(hasN ? [f(s.normal && s.normal.mean), f(s.departure && s.departure.mean), f(s.pct && s.pct.mean, 1)] : [])].join(","));
-  });
-  downloadText(lines.join("\r\n"), `saved_locations_${d.meta.source}.csv`);
+  const btn = $("export-values");
+  btn.disabled = true;
+  try {
+    // which days/hours are missing at the locations marked with * (one pass over the files)
+    const pp = sel.points.filter((x) => (v.points[x.i] || {}).partial);
+    const pa = sel.areas.filter((x) => (v.areas[x.i] || {}).partial);
+    const missing = new Map();
+    if (pp.length + pa.length) {
+      btn.textContent = "Checking missing data…";
+      const lists = await missingFor(d, pp.map((x) => ({ lat: x.item.lat, lon: x.item.lon })), pa.map((x) => x.item.geometry));
+      [...pp, ...pa].forEach((x, k) => missing.set(x.item.id, lists[k]));
+    }
+    const f = (x, n = 3) => (x == null || !Number.isFinite(x) ? "" : x.toFixed(n));
+    const lines = [`# ${d.meta.product}`, `# ${periodLabel(d)}${d.meta.source === "stage4" ? " (days end 12:00 UTC)" : ""}`,
+      "# values include only the data available; complete = no means some days/hours had no data (listed in missing_data)",
+      ["type", "name", "lat", "lon", "area_km2", "precip_in", "max_in", "min_in", ...(hasN ? ["normal_in", "departure_in", "pct_of_normal"] : []), "complete", "missing_data"].join(",")];
+    const tail = (id, has) => [has ? (missing.has(id) ? "no" : "yes") : "", csvCell((missing.get(id) || []).join("; "))];
+    for (const { item: p, i } of sel.points) {
+      const s = v.points[i] || {};
+      lines.push(["point", csvCell(p.name), p.lat.toFixed(5), p.lon.toFixed(5), "", f(s.obs), "", "", ...(hasN ? [f(s.normal), f(s.departure), f(s.pct, 1)] : []), ...tail(p.id, s.obs != null)].join(","));
+    }
+    for (const { item: a, i } of sel.areas) {
+      const s = v.areas[i] || {};
+      const c = labelPoint(a.geometry);
+      lines.push(["area", csvCell(a.name), c[0].toFixed(5), c[1].toFixed(5), a.area_km2.toFixed(2), f(s.obs && s.obs.mean), f(s.obs && s.obs.max), f(s.obs && s.obs.min),
+        ...(hasN ? [f(s.normal && s.normal.mean), f(s.departure && s.departure.mean), f(s.pct && s.pct.mean, 1)] : []), ...tail(a.id, !!s.obs)].join(","));
+    }
+    downloadText(lines.join("\r\n"), `saved_locations_${d.meta.source}.csv`);
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = "Values CSV";
+  }
 });
 
 $("export-breakdown").addEventListener("click", async () => {
   if (!state.main) return;
-  const pts = state.saved.points, ars = state.saved.areas;
-  if (!(pts.length + ars.length)) return setStatus("Save some points or areas first.", true);
+  const sel = checkedLocations();
+  if (!sel.count) return setStatus("Tick at least one saved location (checkbox on the left) to export.", true);
+  const pts = sel.points.map((x) => x.item), ars = sel.areas.map((x) => x.item);
   const btn = $("export-breakdown");
   btn.disabled = true;
   try {
-    const j = await call("series", [state.main.meta, pts.map((p) => ({ lat: p.lat, lon: p.lon })), ars.map((a) => a.geometry)], (p) => { btn.textContent = `${p.message}…`; });
+    const j = await call("series", [state.main.meta, pts.map((p) => ({ lat: p.lat, lon: p.lon })), ars.map((a) => a.geometry), state.interval], (p) => { btn.textContent = `${p.message}…`; });
     const m = state.main.meta;
+    const names = [...pts.map((p) => p.name), ...ars.map((a) => `${a.name} (area avg)`)];
     const series = [...j.points, ...j.areas];
-    const lines = [`# ${m.product}`, `# ${m.label}`, `# precipitation in inches per ${j.step}; period_end_utc = end of each ${j.step}`,
-      ["period_end_utc", ...pts.map((p) => csvCell(p.name)), ...ars.map((a) => csvCell(`${a.name} (area avg)`))].join(",")];
-    j.times.forEach((t, i) => lines.push([t.end_utc, ...series.map((s) => (s[i] == null ? "" : s[i].toFixed(3)))].join(",")));
-    lines.push(["TOTAL", ...series.map((s) => s.reduce((a, x) => a + (x || 0), 0).toFixed(3))].join(","));
-    downloadText(lines.join("\r\n"), `saved_breakdown_${m.source}.csv`);
+    const lines = [`# ${m.product}`, `# ${m.label}`,
+      `# precipitation in inches per ${j.interval}${m.source === "stage4" ? " (days end 12:00 UTC)" : ""}; values include only the data available; missing_data lists what had no data`,
+      ["period", "period_start_utc", "period_end_utc", ...names.map(csvCell), "missing_data"].join(",")];
+    j.bins.forEach((b, i) => {
+      const notes = series.map((s, k) => (s[i].m.length ? `${names[k]}: ${s[i].m.join(", ")}` : null)).filter(Boolean);
+      lines.push([csvCell(b.label + (b.partial ? " (partial period)" : "")), b.start_utc, b.end_utc,
+        ...series.map((s) => (s[i].v == null ? "" : s[i].v.toFixed(3))), csvCell(notes.join(" | "))].join(","));
+    });
+    lines.push(["TOTAL", "", "", ...series.map((s) => s.reduce((a, x) => a + (x.v || 0), 0).toFixed(3)), ""].join(","));
+    downloadText(lines.join("\r\n"), `saved_breakdown_${m.source}_${j.interval}.csv`);
   } catch (e) {
     setStatus(e.message, true);
   } finally {
@@ -1111,7 +1236,7 @@ $("export-breakdown").addEventListener("click", async () => {
 
 // backup / share
 $("export-locs").addEventListener("click", () => {
-  const strip = (x) => { const { shared, ...rest } = x; return rest; };
+  const strip = (x) => { const { shared, off, ...rest } = x; return rest; };
   const doc = { points: state.saved.points.map(strip), areas: state.saved.areas.map(strip) };
   downloadText(JSON.stringify(doc, null, 1), "locations.json", "application/json");
 });

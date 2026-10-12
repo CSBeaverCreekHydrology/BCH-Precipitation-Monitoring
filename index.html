@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#1f6feb">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4C24 18 12 30 12 42a20 20 0 0 0 40 0C52 30 40 18 32 4z' fill='%231f6feb'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="css/style.css?v=1">
+<link rel="stylesheet" href="css/style.css?v=2">
 </head>
 <body>
 <aside id="panel">
@@ -126,6 +126,9 @@
     </div>
     <label>Opacity <span class="muted" id="opacity-val">40%</span><input type="range" id="opacity" min="0.1" max="1" step="0.05" value="0.4"></label>
 
+    <label id="interval-wrap" class="hidden">Time step (breakdowns, CSV and step-through)
+      <select id="interval"></select>
+    </label>
     <div id="steps" class="steps hidden">
       <div class="seg" role="radiogroup" aria-label="Map shows">
         <button class="seg-btn active" data-mode="total">Range total</button>
@@ -180,6 +183,10 @@
       <span>Tap corners · tap the first corner, double-click or press Finish · Esc cancels</span>
       <button id="draw-finish">Finish</button>
     </div>
+    <div class="inc-row hidden" id="inc-row">
+      <span class="muted" id="inc-count"></span>
+      <span>Select <button class="link" id="inc-all">all</button>·<button class="link" id="inc-none">none</button></span>
+    </div>
     <ul id="saved-list" class="saved-list"></ul>
     <p class="note" id="saved-empty">No saved points or areas yet.</p>
     <div class="row2 saved-actions">
@@ -212,6 +219,6 @@
 <div id="hover" class="hover hidden"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script type="module" src="js/app.js?v=1"></script>
+<script type="module" src="js/app.js?v=2"></script>
 </body>
 </html>

@@ -5,9 +5,13 @@
 //     water.noaa.gov/resources/downloads/precip/stageIV/YYYY/MM/DD/  (GeoTIFF; NCEP GRIB tarball fallback)
 //   MRMS hourly (NOAA/NSSL, ~1 km), October 2020-present, NOAA Open Data on AWS
 //     noaa-mrms-pds.s3.amazonaws.com/CONUS/<product>_00.00/YYYYMMDD/
+//
+// Missing data: totals add up whatever is available. For every grid cell `miss` counts the files
+// (days / hour blocks) with no value there; the page marks those totals with an asterisk.
 
-import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js";
-import { Sampler, sameGrid, gridKey } from "./grid.js";
+import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=2";
+import { Sampler, sameGrid, gridKey } from "./grid.js?v=2";
+import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=2";
 
 export const S4_BASE = "https://water.noaa.gov/resources/downloads/precip/stageIV";
 export const MRMS_BASE = "https://noaa-mrms-pds.s3.amazonaws.com";
@@ -25,9 +29,6 @@ export const MRMS_PRODUCTS = {
 };
 const S4_LASTN = [365, 180, 120, 90, 60, 30, 14, 10, 7, 6, 5, 4, 3, 2];
 const S4_DAILY_TIF_MAX = 62;          // longer ranges use the ~5x smaller GRIB tarballs (no normals)
-export const SERIES_MAX_DAYS = 92;
-export const SERIES_MAX_HOURS = 72;
-export const MRMS_MAX_HOURS = 744;    // 31 days
 const MRMS_WINDOWS = [72, 48, 24, 12, 6, 3, 1];
 const DAY = 86400000, HOUR = 3600000;
 
@@ -38,6 +39,7 @@ export const isoDay = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-
 export const parseDay = (s) => new Date(`${s}T00:00:00Z`);
 const todayUtc = () => parseDay(isoDay(new Date()));
 const daysAgo = (d) => Math.round((todayUtc() - d) / DAY);
+const roundHour = (t) => new Date(Math.round(+t / HOUR) * HOUR);
 
 export class UserError extends Error {}
 
@@ -89,7 +91,7 @@ async function pruneCache() {
   if (++pruneTick % 25) return;
   const cache = await caches.open(CACHE_NAME);
   const keys = await cache.keys();
-  for (const k of keys.slice(0, Math.max(0, keys.length - 600))) await cache.delete(k);
+  for (const k of keys.slice(0, Math.max(0, keys.length - 1500))) await cache.delete(k);
 }
 
 async function getText(url, opts) {
@@ -190,8 +192,10 @@ async function s4Plan(start, end, region) {
     if (best) { parts.push({ kind: "window", d, n: best[1], fname: best[0] }); d = new Date(d - best[1] * DAY); rem -= best[1]; }
     else { parts.push({ kind: "day", d, n: 1 }); d = new Date(d - DAY); rem -= 1; }
   }
-  return parts;
+  return parts.reverse();
 }
+
+const s4PartLabel = (pt) => (pt.n === 1 ? fmtDay(pt.d) : `${fmtDay(new Date(+pt.d - (pt.n - 1) * DAY))} – ${fmtDay(pt.d)}`);
 
 function gridFromTiff(t, region) {
   const g = { kind: "hrap", R: REGIONS[region].grid.R, x0: t.tiepoint[3], y0: t.tiepoint[4], dx: t.pixelScale[0], dy: t.pixelScale[1], width: t.width, height: t.height };
@@ -249,6 +253,60 @@ async function s4Day(d, region, preferTif) {
   return null;
 }
 
+async function s4LoadPart(pt, region, preferTif) {
+  try {
+    const g = pt.kind === "window" ? await s4Tif(pt.d, pt.fname, region) : await s4Day(pt.d, region, preferTif);
+    return g && sameGrid(g.grid, REGIONS[region].grid) ? g : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Running sum that tolerates missing files and missing cells. */
+class Accumulator {
+  constructor(grid, withNormals) {
+    const N = grid.width * grid.height;
+    this.grid = grid;
+    this.obs = new Float32Array(N);
+    this.normal = withNormals ? new Float32Array(N) : null;
+    this.miss = new Uint16Array(N);
+    this.parts = 0;
+    this.missingParts = [];         // labels of whole files that are missing
+    this.hasNormals = withNormals;
+  }
+  add(g) {
+    this.parts++;
+    const o = g.obs, n = g.normal, obs = this.obs, miss = this.miss;
+    if (!n) this.hasNormals = false;
+    const nrm = this.hasNormals ? this.normal : null;
+    for (let k = 0; k < o.length; k++) {
+      const v = o[k];
+      if (v >= 0) { obs[k] += v; if (nrm) nrm[k] += n[k]; } else miss[k]++;
+    }
+  }
+  missing(label) { this.parts++; this.missingParts.push(label); }
+  finish() {
+    const P = this.parts, gm = this.missingParts.length, obs = this.obs, miss = this.miss, nrm = this.hasNormals ? this.normal : null;
+    let partialCells = 0;
+    for (let k = 0; k < obs.length; k++) {
+      miss[k] += gm;
+      if (miss[k] >= P) { obs[k] = NaN; if (nrm) nrm[k] = NaN; }
+      else if (miss[k] > gm) partialCells++;
+    }
+    return { obs, normal: nrm, miss, nParts: P, partialCells };
+  }
+}
+
+function missingWarnings(acc, done, unit) {
+  const w = [];
+  if (acc.missingParts.length) {
+    const list = acc.missingParts.slice(0, 8).join("; ") + (acc.missingParts.length > 8 ? `; +${acc.missingParts.length - 8} more` : "");
+    w.push(`* Some ${unit} are missing from the archive, so totals include only the data available. Missing: ${list}.`);
+  }
+  if (done.partialCells) w.push(`* At some locations a few ${unit} have no data (for example radar or gauge outages). Those totals are marked with *; click a location to see which ${unit}.`);
+  return w;
+}
+
 export async function computeStage4(p, progress) {
   if (!REGIONS[p.region]) throw new UserError("Unknown region");
   const start = parseDay(p.start), end = parseDay(p.end);
@@ -260,77 +318,30 @@ export async function computeStage4(p, progress) {
   progress({ done: 0, total: 1, message: "Planning downloads…" });
   const parts = await s4Plan(start, end, p.region);
   const preferTif = ndays <= S4_DAILY_TIF_MAX;
+  const acc = new Accumulator(REGIONS[p.region].grid, true);
   let done = 0;
-  const loaded = await pool(parts, 6, async (part) => {
-    let g = null;
-    try { g = part.kind === "window" ? await s4Tif(part.d, part.fname, p.region) : await s4Day(part.d, p.region, preferTif); }
-    catch (e) { g = null; part.error = e.message; }
-    done++;
-    progress({ done, total: parts.length, message: `Downloaded ${done} of ${parts.length} file(s)` });
-    return g;
+  const srcs = [];
+  await pool(parts, 6, async (pt, i) => {
+    const g = await s4LoadPart(pt, p.region, preferTif);
+    if (g) acc.add(g); else acc.missing(s4PartLabel(pt));            // summed as it arrives: no long-range memory build-up
+    srcs[i] = g ? g.src : "missing";
+    progress({ done: ++done, total: parts.length, message: `Downloaded ${done} of ${parts.length} file(s)` });
   });
-  const ref = loaded.find((g) => g && g.normal) || loaded.find((g) => g);
-  if (!ref) throw new UserError("No Stage IV data was found for that range.");
-  const N = ref.obs.length;
-  const obs = new Float32Array(N), normal = new Float32Array(N);
-  let hasNormals = true;
-  const missing = [];
-  loaded.forEach((g, i) => {
-    const part = parts[i];
-    if (!g || !sameGrid(g.grid, ref.grid)) {
-      for (let k = 0; k < part.n; k++) missing.push(new Date(part.d - k * DAY));
-      return;
-    }
-    for (let k = 0; k < N; k++) obs[k] += g.obs[k];
-    if (g.normal) for (let k = 0; k < N; k++) normal[k] += g.normal[k];
-    else hasNormals = false;
-  });
-  const warnings = [];
-  if (missing.length) {
-    missing.sort((a, b) => a - b);
-    const fmt = (x) => x.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" });
-    warnings.push(`${missing.length} day(s) missing from the NWS archive and excluded: ${missing.slice(0, 6).map(fmt).join(", ")}${missing.length > 6 ? ` (+${missing.length - 6} more)` : ""}`);
-  }
-  if (!hasNormals) warnings.push("Normals are unavailable for part of this range (archive GRIB files), so departure and % of normal are off.");
-  const fmtD = (x) => x.toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "2-digit", year: "numeric" });
+  if (acc.missingParts.length === parts.length) throw new UserError("No Stage IV data was found for that range.");
+  const r = acc.finish();
+  const warnings = missingWarnings(acc, r, "days");
+  if (!acc.hasNormals) warnings.push("Normals are unavailable for part of this range (archive GRIB files), so departure and % of normal are off.");
   return {
     meta: {
       source: "stage4", region: p.region, product: `Stage IV multisensor QPE – ${REGIONS[p.region].label}`,
-      label: `${ndays === 1 ? fmtD(end) : `${fmtD(start)} – ${fmtD(end)}`} (${ndays} day${ndays > 1 ? "s" : ""})`,
+      label: `${ndays === 1 ? fmtDay(end) : `${fmtDay(start)} – ${fmtDay(end)}`} (${ndays} day${ndays > 1 ? "s" : ""})`,
       start: p.start, end: p.end, start_utc: new Date(+start - DAY + 12 * HOUR).toISOString(), end_utc: new Date(+end + 12 * HOUR).toISOString(),
-      n_steps: ndays, step: "day", has_normals: hasNormals, resolution: "4.76 km HRAP grid", warnings,
-      files: parts.map((pt, i) => `${pt.fname || `1day (${loaded[i] ? loaded[i].src : "missing"})`} @ ${isoDay(pt.d)}`),
+      n_steps: ndays, step: "day", has_normals: acc.hasNormals, resolution: "4.76 km HRAP grid", warnings,
+      n_parts: r.nParts, missing: acc.missingParts,
+      files: parts.map((pt, i) => `${pt.fname || `1day (${srcs[i]})`} @ ${isoDay(pt.d)}`),
       computed_utc: new Date().toISOString(),
     },
-    grid: ref.grid, obs, normal: hasNormals ? normal : null,
-  };
-}
-
-export async function stage4Series(meta, points, areas, progress) {
-  const start = parseDay(meta.start), end = parseDay(meta.end);
-  const n = Math.round((end - start) / DAY) + 1;
-  if (n > SERIES_MAX_DAYS) throw new UserError(`Daily breakdown is limited to ${SERIES_MAX_DAYS} days.`);
-  const days = Array.from({ length: n }, (_, i) => new Date(+start + i * DAY));
-  const samplers = new Map();
-  let done = 0;
-  const rows = await pool(days, 6, async (d) => {
-    let g = null;
-    try { g = await s4Day(d, meta.region, n <= S4_DAILY_TIF_MAX); } catch (_) { g = null; }
-    progress && progress({ done: ++done, total: n, message: `Reading day ${done} of ${n}` });
-    if (!g) return null;
-    const key = gridKey(g.grid);
-    if (!samplers.has(key)) samplers.set(key, new Sampler(g.grid, points, areas));
-    const s = samplers.get(key);
-    return [s.points(g.obs), s.areas(g.obs, false)];
-  });
-  return seriesResult("day", days.map((d) => ({ t: isoDay(d), end_utc: `${isoDay(d)}T12:00:00Z` })), rows, points.length, areas.length);
-}
-
-function seriesResult(step, times, rows, nPts, nAreas) {
-  return {
-    step, times,
-    points: Array.from({ length: nPts }, (_, k) => rows.map((r) => (r ? r[0][k] : null))),
-    areas: Array.from({ length: nAreas }, (_, k) => rows.map((r) => (r ? r[1][k] : null))),
+    grid: acc.grid, obs: r.obs, normal: r.normal, miss: r.miss,
   };
 }
 
@@ -358,9 +369,10 @@ export async function mrmsLatest(product) {
   throw new Error("Could not list MRMS files on NOAA Open Data (AWS)");
 }
 
-/** Plan [t0, t1] (hours) with the fewest files from `windows` (shortest path over hour offsets). */
+/** Plan [t0, t1] (whole hours) with the fewest files from `windows` (shortest path over hour offsets). */
 function mrmsPlan(t0, t1, windows) {
   const n = Math.round((t1 - t0) / HOUR);
+  if (n <= 0) return [];
   const best = new Array(n + 1).fill(null);
   best[0] = [0, -1, 0];
   for (let i = 1; i <= n; i++) {
@@ -370,8 +382,10 @@ function mrmsPlan(t0, t1, windows) {
   }
   const parts = [];
   for (let i = n; i > 0; i = best[i][1]) parts.push({ t: new Date(+t0 + i * HOUR), w: best[i][2] });
-  return parts;
+  return parts.reverse();
 }
+
+const mrmsPartLabel = (t, w) => (w === 1 ? `hour ending ${fmtLocal(t)}` : `${fmtLocal(new Date(+t - w * HOUR))} – ${fmtLocal(t)}`);
 
 async function mrmsGrid(product, w, t) {
   const key = `mrms:${mrmsKey(product, w, t)}`;
@@ -389,66 +403,112 @@ async function mrmsGrid(product, w, t) {
   });
 }
 
+/** Visit the files covering one planned MRMS part; a missing multi-hour file is replaced by shorter ones. */
+async function mrmsVisit(product, t, w, visit, onFile) {
+  let g = null;
+  try { g = await mrmsGrid(product, w, t); } catch (_) { g = null; }
+  onFile && onFile();
+  if (g) return visit(g, mrmsPartLabel(t, w), t, w);
+  if (w === 1) return visit(null, mrmsPartLabel(t, w), t, w);
+  const sub = mrmsPlan(new Date(+t - w * HOUR), t, MRMS_WINDOWS.filter((x) => x < w));
+  for (const s of sub) await mrmsVisit(product, s.t, s.w, visit, onFile);
+}
+
 export async function computeMrms(p, progress) {
   if (!MRMS_PRODUCTS[p.product]) throw new UserError("Unknown MRMS product");
-  const t0 = new Date(Math.round(Date.parse(p.start) / HOUR) * HOUR), t1 = new Date(Math.round(Date.parse(p.end) / HOUR) * HOUR);
+  const t0 = roundHour(new Date(p.start)), t1 = roundHour(new Date(p.end));
   const hours = Math.round((t1 - t0) / HOUR);
   if (hours < 1) throw new UserError("End must be at least one hour after start.");
-  if (hours > MRMS_MAX_HOURS) throw new UserError(`Hourly (MRMS) ranges are limited to ${MRMS_MAX_HOURS / 24} days; use the daily archive for longer periods.`);
   if (t0 < new Date(MRMS_EARLIEST)) throw new UserError("The MRMS archive on NOAA Open Data starts Oct 15, 2020; use the daily archive for older dates.");
   const latest = new Date(await mrmsLatest(p.product));
   if (t1 > latest) throw new UserError(`Latest available hour ends ${latest.toISOString().slice(0, 16).replace("T", " ")} UTC.`);
   const parts = mrmsPlan(t0, t1, MRMS_WINDOWS);
-  let sum = null, grid = null, done = 0, total = parts.length;
-  const used = [], missingHours = [];
-  // sequential: each MRMS grid is ~100 MB in memory
-  const addPart = async (t, w) => {
-    const g = await mrmsGrid(p.product, w, t);
-    done++;
-    progress({ done, total, message: `Downloaded ${done} of ${total} file(s)` });
-    if (!g) {
-      if (w === 1) { missingHours.push(t); return; }
-      const sub = mrmsPlan(new Date(+t - w * HOUR), t, MRMS_WINDOWS.filter((x) => x < w));
-      total += sub.length;
-      for (const s of sub) await addPart(s.t, s.w);
-      return;
-    }
-    if (!sum) { sum = new Float32Array(g.obs.length); grid = g.grid; }
-    const o = g.obs;
-    for (let i = 0; i < o.length; i++) sum[i] += o[i];
-    used.push(`${MRMS_PRODUCTS[p.product].dir(w)} ending ${t.toISOString().slice(0, 13).replace("T", " ")}Z`);
-  };
-  for (const part of parts) await addPart(part.t, part.w);
-  if (!sum) throw new UserError("No MRMS data was found for that range.");
-  const warnings = missingHours.length ? [`${missingHours.length} hour(s) missing from the MRMS archive and counted as zero.`] : [];
+  let acc = null, done = 0;
+  const pendingMissing = [], used = [];
+  for (const part of parts) {                    // sequential: each MRMS grid is ~100 MB in memory
+    await mrmsVisit(p.product, part.t, part.w, (g, label, t, w) => {
+      if (!g) { if (acc) acc.missing(label); else pendingMissing.push(label); return; }
+      if (!acc) { acc = new Accumulator(g.grid, false); pendingMissing.forEach((l) => acc.missing(l)); }
+      acc.add(g);
+      used.push(`${MRMS_PRODUCTS[p.product].dir(w)} ending ${t.toISOString().slice(0, 13).replace("T", " ")}Z`);
+    }, () => progress({ done: ++done, total: Math.max(done, parts.length), message: `Downloaded ${done} file(s) of ${parts.length}+` }));
+  }
+  if (!acc) throw new UserError("No MRMS data was found for that range.");
+  const r = acc.finish();
   const z = (d) => d.toISOString().slice(5, 16).replace("T", " ");
   return {
     meta: {
       source: "mrms", product: `MRMS ${MRMS_PRODUCTS[p.product].label}`, product_key: p.product,
       label: `${z(t0)} – ${z(t1)} UTC (${hours} h)`, start_utc: t0.toISOString(), end_utc: t1.toISOString(),
-      n_steps: hours, step: "hour", has_normals: false, resolution: "0.01° (~1 km) grid", warnings, files: used,
-      computed_utc: new Date().toISOString(),
+      n_steps: hours, step: "hour", has_normals: false, resolution: "0.01° (~1 km) grid", warnings: missingWarnings(acc, r, "hours"),
+      n_parts: r.nParts, missing: acc.missingParts, files: used, computed_utc: new Date().toISOString(),
     },
-    grid, obs: sum, normal: null,
+    grid: acc.grid, obs: r.obs, normal: null, miss: r.miss,
   };
 }
 
-export async function mrmsSeries(meta, points, areas, progress) {
-  const t0 = new Date(meta.start_utc);
-  const n = meta.n_steps;
-  if (n > SERIES_MAX_HOURS) throw new UserError(`Hourly breakdown is limited to ${SERIES_MAX_HOURS} hours.`);
-  const hours = Array.from({ length: n }, (_, i) => new Date(+t0 + (i + 1) * HOUR));
-  let sampler = null, done = 0;
-  const rows = [];
-  for (const t of hours) {               // sequential to bound memory
-    let g = null;
-    try { g = await mrmsGrid(meta.product_key, 1, t); } catch (_) { g = null; }
-    progress && progress({ done: ++done, total: n, message: `Reading hour ${done} of ${n}` });
-    if (!g) { rows.push(null); continue; }
-    if (!sampler) sampler = new Sampler(g.grid, points, areas);
-    rows.push([sampler.points(g.obs), sampler.areas(g.obs, false)]);
+// ----------------------------------------------------------------- breakdowns (any length, any interval)
+/** Per-bin totals at points and area averages.
+ *  interval: "hour" | "day" | "month" | "total" ("total" = one bin: used to list missing periods).
+ *  Returns {interval, bins, points: [[{v, m}]], areas: [[{v, m}]]}; v = sum of available data (null if none),
+ *  m = labels of days/hours with no data at that location. */
+export async function series(meta, points, areas, interval, progress) {
+  const bins = makeBins(meta, interval);
+  const P = points.length, A = areas.length, L = P + A;
+  const acc = bins.map(() => ({ v: new Float64Array(L), any: new Uint8Array(L), m: Array.from({ length: L }, () => []) }));
+  const covs = [];                                   // area coverage per file, to spot partly-missing areas
+  const samplers = new Map();
+  const sampler = (g) => {
+    const key = gridKey(g.grid);
+    if (!samplers.has(key)) samplers.set(key, new Sampler(g.grid, points, areas));
+    return samplers.get(key);
+  };
+  const take = (bi, g, label) => {
+    const a = acc[bi];
+    if (!g) { for (let j = 0; j < L; j++) a.m[j].push(label); return; }
+    const s = sampler(g);
+    s.points(g.obs).forEach((v, j) => { if (v == null) a.m[j].push(label); else { a.v[j] += v; a.any[j] = 1; } });
+    s.masks.forEach((mask, ai) => {
+      const j = P + ai;
+      let n = 0, sum = 0;
+      if (mask) for (let k = 0; k < mask.length; k++) { const v = g.obs[mask[k]]; if (v >= 0) { n++; sum += v; } }
+      if (!n) { a.m[j].push(label); return; }
+      a.v[j] += sum / n; a.any[j] = 1;
+      covs.push({ bi, j, cov: n / mask.length, label });
+    });
+  };
+
+  let done = 0, total = 0;
+  const tick = () => progress && progress({ done: ++done, total: Math.max(done, total), message: `Reading file ${done} of ${total}` });
+  if (meta.source === "stage4") {
+    const jobs = [];
+    for (let bi = 0; bi < bins.length; bi++) {
+      for (const pt of await s4Plan(parseDay(bins[bi].start), parseDay(bins[bi].end), meta.region)) jobs.push({ bi, pt });
+    }
+    total = jobs.length;
+    await pool(jobs, 6, async ({ bi, pt }) => {
+      const g = await s4LoadPart(pt, meta.region, false);
+      take(bi, g, s4PartLabel(pt));
+      tick();
+    });
+  } else {
+    const plans = bins.map((b) => mrmsPlan(roundHour(new Date(b.start)), roundHour(new Date(b.end)), MRMS_WINDOWS));
+    total = plans.reduce((a, p) => a + p.length, 0);
+    for (let bi = 0; bi < bins.length; bi++) {        // sequential to bound memory
+      for (const part of plans[bi]) await mrmsVisit(meta.product_key, part.t, part.w, (g, label) => take(bi, g, label), tick);
+    }
   }
-  return seriesResult("hour", hours.map((t) => ({ t: t.toISOString(), end_utc: t.toISOString() })), rows, points.length, areas.length);
+  // an area is "partly missing" in a file when fewer of its cells have data than in its best-covered file
+  const maxCov = new Map();
+  for (const c of covs) maxCov.set(c.j, Math.max(maxCov.get(c.j) || 0, c.cov));
+  for (const c of covs) if (c.cov < maxCov.get(c.j) - 1e-9) acc[c.bi].m[c.j].push(`${c.label} (part of area)`);
+
+  const out = (j) => acc.map((a) => ({ v: a.any[j] ? a.v[j] : null, m: a.m[j] }));
+  return {
+    interval, bins,
+    points: Array.from({ length: P }, (_, k) => out(k)),
+    areas: Array.from({ length: A }, (_, k) => out(P + k)),
+  };
 }
 
 // ----------------------------------------------------------------- public API (called through the worker)
@@ -456,13 +516,11 @@ export const api = {
   config: async () => ({
     regions: Object.fromEntries(Object.entries(REGIONS).map(([k, v]) => [k, v.label])),
     mrms_products: Object.fromEntries(Object.entries(MRMS_PRODUCTS).map(([k, v]) => [k, v.label])),
-    s4_earliest: S4_EARLIEST, mrms_earliest: MRMS_EARLIEST, series_max_days: SERIES_MAX_DAYS,
-    series_max_hours: SERIES_MAX_HOURS, mrms_max_hours: MRMS_MAX_HOURS,
+    s4_earliest: S4_EARLIEST, mrms_earliest: MRMS_EARLIEST,
   }),
   refresh: async () => { refresh(); return true; },
   s4Latest: (region) => s4Latest(region),
   mrmsLatest: (product) => mrmsLatest(product),
   accumulate: (p, progress) => (p.source === "stage4" ? computeStage4(p, progress) : computeMrms(p, progress)),
-  series: (meta, points, areas, progress) =>
-    (meta.source === "stage4" ? stage4Series(meta, points, areas, progress) : mrmsSeries(meta, points, areas, progress)),
+  series: (meta, points, areas, interval, progress) => series(meta, points, areas, interval, progress),
 };

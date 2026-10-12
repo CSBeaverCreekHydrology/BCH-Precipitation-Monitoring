@@ -171,6 +171,12 @@ export class Sampler {
   }
 }
 
+/** Fraction of an area's cells with data: 0 < missing count < number of parts means "partly missing". */
+export function areaHasPartial(miss, idx, nParts) {
+  for (let k = 0; k < idx.length; k++) { const m = miss[idx[k]]; if (m > 0 && m < nParts) return true; }
+  return false;
+}
+
 // ----------------------------------------------------------------- colour scales
 export const NWS_COLORS = ["#04e9e7", "#019ff4", "#0300f4", "#02fd02", "#01c501", "#008e00", "#fdf802", "#e5bc00",
   "#fd9500", "#fd0000", "#d40000", "#bc0000", "#f800fd", "#9854c6", "#fdfdfd"];
