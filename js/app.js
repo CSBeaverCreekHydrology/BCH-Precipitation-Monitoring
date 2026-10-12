@@ -3,10 +3,10 @@
 import {
   cellIndex, gridBounds, legendFor, colorOf, autoScale, autoDepScale, areaStats, areaMask,
   labelPoint, polygonAreaKm2, geoTagsFor, colRow, VAR_LABELS, areaHasPartial,
-} from "./grid.js?v=2";
-import { writeGeoTiff } from "./decoders.js?v=2";
-import { importAreas } from "./shapes.js?v=2";
-import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=2";
+} from "./grid.js?v=3";
+import { writeGeoTiff } from "./decoders.js?v=3";
+import { importAreas } from "./shapes.js?v=3";
+import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=3";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (t) => new Promise((r) => setTimeout(r, t));
@@ -15,7 +15,7 @@ const rid = () => Math.random().toString(36).slice(2, 12);
 const HOUR = 3600000, DAY = 86400000;
 
 // ------------------------------------------------------------------ worker RPC
-const worker = new Worker(new URL("./worker.js?v=2", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./worker.js?v=3", import.meta.url), { type: "module" });
 const pending = new Map();
 let callSeq = 0;
 worker.onmessage = (ev) => {
@@ -206,7 +206,12 @@ function downloadBlob(blob, name) {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
-const downloadText = (text, name, type) => downloadBlob(new Blob([text], { type: type || "text/csv" }), name);
+// CSVs: plain hyphens instead of en/em dashes, and a UTF-8 byte-order mark so Excel doesn't read
+// the file as Windows-1252 (which turns "–" into "â€“").
+const downloadText = (text, name, type) => {
+  if (!type || type === "text/csv") text = "﻿" + text.replace(/[–—]/g, "-");
+  downloadBlob(new Blob([text], { type: type || "text/csv;charset=utf-8" }), name);
+};
 
 // ------------------------------------------------------------------ source tabs + inputs
 function setSource(src) {
