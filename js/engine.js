@@ -9,9 +9,9 @@
 // Missing data: totals add up whatever is available. For every grid cell `miss` counts the files
 // (days / hour blocks) with no value there; the page marks those totals with an asterisk.
 
-import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=3";
-import { Sampler, sameGrid, gridKey } from "./grid.js?v=3";
-import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=3";
+import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=4";
+import { Sampler, sameGrid, gridKey } from "./grid.js?v=4";
+import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=4";
 
 export const S4_BASE = "https://water.noaa.gov/resources/downloads/precip/stageIV";
 export const MRMS_BASE = "https://noaa-mrms-pds.s3.amazonaws.com";
@@ -56,8 +56,11 @@ export function refresh() {
   for (const [k, v] of grids) if (v.recent) { gridBytes -= v.bytes; grids.delete(k); }
 }
 
-/** GET url -> Uint8Array, or null when the file does not exist. immutable files go to Cache Storage. */
-async function getBytes(url, { immutable = false, revalidate = false } = {}) {
+/** GET url -> Uint8Array, or null when the file does not exist. immutable files go to Cache Storage.
+ *  missingOk: water.noaa.gov answers "404 Not Found" WITHOUT the CORS header, so in a browser a missing
+ *  file or folder looks like a network failure (fetch throws TypeError). For requests that may
+ *  legitimately not exist (folder listings), treat that as "not there" after one quick retry. */
+async function getBytes(url, { immutable = false, revalidate = false, missingOk = false } = {}) {
   let cache = null;
   if (immutable && hasCacheApi) {
     try {
@@ -67,7 +70,8 @@ async function getBytes(url, { immutable = false, revalidate = false } = {}) {
     } catch (_) { cache = null; }
   }
   let last;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const attempts = missingOk ? 2 : 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const r = await fetch(url, { cache: revalidate ? "no-cache" : "default" });
       if (r.status === 404 || r.status === 403) return null;
@@ -80,9 +84,10 @@ async function getBytes(url, { immutable = false, revalidate = false } = {}) {
       return new Uint8Array(buf);
     } catch (e) {
       last = e;
-      await new Promise((res) => setTimeout(res, 800 * (attempt + 1)));
+      await new Promise((res) => setTimeout(res, (missingOk ? 300 : 800) * (attempt + 1)));
     }
   }
+  if (missingOk) return null;
   throw new Error(`Download failed (${last && last.message}): ${url}`);
 }
 
@@ -91,7 +96,7 @@ async function pruneCache() {
   if (++pruneTick % 25) return;
   const cache = await caches.open(CACHE_NAME);
   const keys = await cache.keys();
-  for (const k of keys.slice(0, Math.max(0, keys.length - 1500))) await cache.delete(k);
+  for (const k of keys.slice(0, Math.max(0, keys.length - 800))) await cache.delete(k);
 }
 
 async function getText(url, opts) {
@@ -142,28 +147,36 @@ const latestCache = new Map();
 const s4Dir = (d) => `${S4_BASE}/${ymdSlash(d)}/`;
 const s4Recent = (d) => daysAgo(d) <= 5;
 
+/** File names in one day's folder (empty set when the folder isn't posted yet or can't be read). */
 async function s4Listing(d) {
   const key = isoDay(d);
   const hit = listings.get(key);
-  const ttl = daysAgo(d) <= 20 ? 10 * 60000 : Infinity;
-  if (hit && Date.now() - hit.t < ttl) return hit.names;
-  const html = await getText(s4Dir(d), { revalidate: daysAgo(d) <= 20 });
+  const recent = daysAgo(d) <= 20;
+  if (hit && Date.now() - hit.t < hit.ttl) return hit.names;
+  // folders older than a month no longer change, so keep them in Cache Storage like the data files
+  const html = await getText(s4Dir(d), { revalidate: recent, immutable: daysAgo(d) > 30, missingOk: true });
   const names = new Set(html ? [...html.matchAll(/href="([^"?/]+)"/g)].map((m) => m[1]) : []);
-  listings.set(key, { t: Date.now(), names });
+  // an empty answer may be a not-yet-posted folder or a brief outage: only trust it for 2 minutes
+  listings.set(key, { t: Date.now(), names, ttl: !names.size ? 2 * 60000 : recent ? 10 * 60000 : Infinity });
   return names;
 }
 
+// latest available day/hour, re-checked every few minutes so a page left open keeps up
+function latestGet(key, ttl) {
+  const hit = latestCache.get(key);
+  return hit && Date.now() - hit.t < ttl ? hit.v : null;
+}
+const latestSet = (key, v) => { latestCache.set(key, { t: Date.now(), v }); return v; };
+
 export async function s4Latest(region) {
-  if (latestCache.has(region)) return latestCache.get(region);
+  const cached = latestGet(region, 10 * 60000);
+  if (cached) return cached;
   const today = todayUtc();
   for (let back = 0; back < 8; back++) {
     const d = new Date(today - back * DAY);
-    if ((await s4Listing(d)).has(`nws_precip_1day_${ymd(d)}_${region}.tif`)) {
-      latestCache.set(region, isoDay(d));
-      return isoDay(d);
-    }
+    if ((await s4Listing(d)).has(`nws_precip_1day_${ymd(d)}_${region}.tif`)) return latestSet(region, isoDay(d));
   }
-  throw new Error("Could not find recent Stage IV files on water.noaa.gov");
+  throw new Error("Could not reach the NWS Stage IV archive (water.noaa.gov). Check the internet connection and press Refresh.");
 }
 
 async function windowCandidates(d, region) {
@@ -241,15 +254,21 @@ async function s4Tar(d, region) {
 
 async function s4Day(d, region, preferTif) {
   const tif = `nws_precip_1day_${ymd(d)}_${region}.tif`;
-  const order = preferTif || cacheGet(`s4tif:${tif}`) ? ["tif", "tar"] : ["tar", "tif"];
+  const tar = `ncep_stage_iv_source_files_${ymd(d)}.tar`;
+  // only request files the day's folder lists: a missing file can't be told apart from a network error
+  const names = await s4Listing(d);
+  let order = preferTif || cacheGet(`s4tif:${tif}`) ? ["tif", "tar"] : ["tar", "tif"];
+  order = order.filter((k) => names.has(k === "tif" ? tif : tar));
+  let lastErr = null;
   for (const k of order) {
     try {
       const g = k === "tif" ? await s4Tif(d, tif, region) : await s4Tar(d, region);
       if (g) return g;
     } catch (e) {
-      if (k === order[1]) throw e;
+      lastErr = e;
     }
   }
+  if (lastErr) throw lastErr;
   return null;
 }
 
@@ -353,7 +372,8 @@ const mrmsKey = (product, h, t) => {
 
 export async function mrmsLatest(product) {
   const key = `mrms:${product}`;
-  if (latestCache.has(key)) return latestCache.get(key);
+  const cached = latestGet(key, 3 * 60000);
+  if (cached) return cached;
   const dir = MRMS_PRODUCTS[product].dir(1);
   for (let back = 0; back < 3; back++) {
     const d = new Date(+todayUtc() - back * DAY);
@@ -362,8 +382,7 @@ export async function mrmsLatest(product) {
     if (keys.length) {
       const [, day, hh] = keys[keys.length - 1];
       const iso = `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6)}T${hh}:00:00.000Z`;
-      latestCache.set(key, iso);
-      return iso;
+      return latestSet(key, iso);
     }
   }
   throw new Error("Could not list MRMS files on NOAA Open Data (AWS)");
@@ -442,6 +461,7 @@ export async function computeMrms(p, progress) {
       label: `${z(t0)} – ${z(t1)} UTC (${hours} h)`, start_utc: t0.toISOString(), end_utc: t1.toISOString(),
       n_steps: hours, step: "hour", has_normals: false, resolution: "0.01° (~1 km) grid", warnings: missingWarnings(acc, r, "hours"),
       n_parts: r.nParts, missing: acc.missingParts, files: used, computed_utc: new Date().toISOString(),
+      prefer_interval: p.prefer || null, local_days: !!p.localDays,
     },
     grid: acc.grid, obs: r.obs, normal: null, miss: r.miss,
   };

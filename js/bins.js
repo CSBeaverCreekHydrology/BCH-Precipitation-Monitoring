@@ -24,6 +24,7 @@ export function intervalsFor(meta) {
 }
 
 export function defaultInterval(meta) {
+  if (meta.prefer_interval && intervalsFor(meta).includes(meta.prefer_interval)) return meta.prefer_interval;
   if (meta.source === "stage4") return meta.n_steps > 92 ? "month" : "day";
   return meta.n_steps <= 72 ? "hour" : meta.n_steps <= 24 * 92 ? "day" : "month";
 }

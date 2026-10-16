@@ -21,6 +21,11 @@ For example, "last 30 days" is a single NWS file, and 72 hours of MRMS is one fi
 - **↻ Refresh** (on the map and by the Load button) re-checks NWS for new or revised data. It rolls
   "last N days" presets forward and redraws the whole map. Optional auto-refresh every 10/30/60 minutes.
 - Observed, PRISM normal, departure from normal, and percent of normal (daily data).
+- **Days run** (Daily tab): NWS Stage IV days are fixed 24-h totals ending 12:00 UTC (8 AM EDT / 7 AM EST).
+  Choose **Midnight to midnight, local time** to build days from NOAA MRMS multi-sensor hourly data
+  instead (Oct 15, 2020 onward, CONUS, no PRISM normals). The last day is partial until midnight.
+- Every breakdown CSV has `period_start_local` / `period_end_local` columns (your computer's time zone)
+  next to the UTC times.
 - **Time step** (shown for longer ranges): hourly, daily or monthly. It drives the breakdown chart,
   the Breakdown CSV and the step-through / ▶ animation. Stage IV months follow the NWS month-to-date
   convention: the 24-h periods ending 12Z on the 2nd through the 1st of the next month.
@@ -71,7 +76,7 @@ git push -u origin main
 
 **Updating:** edit or re-upload files and commit. GitHub Pages republishes within a minute or two.
 Browsers may keep the old version for up to 10 minutes. After changing any file in `css/` or `js/`,
-search-and-replace `?v=3` with the next number (`?v=4`, …) in `index.html` and all `js/*.js`
+search-and-replace `?v=4` with the next number (`?v=5`, …) in `index.html` and all `js/*.js`
 files. That makes everyone load the new copies together.
 
 ## Test locally

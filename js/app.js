@@ -3,10 +3,10 @@
 import {
   cellIndex, gridBounds, legendFor, colorOf, autoScale, autoDepScale, areaStats, areaMask,
   labelPoint, polygonAreaKm2, geoTagsFor, colRow, VAR_LABELS, areaHasPartial,
-} from "./grid.js?v=3";
-import { writeGeoTiff } from "./decoders.js?v=3";
-import { importAreas } from "./shapes.js?v=3";
-import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=3";
+} from "./grid.js?v=4";
+import { writeGeoTiff } from "./decoders.js?v=4";
+import { importAreas } from "./shapes.js?v=4";
+import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=4";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (t) => new Promise((r) => setTimeout(r, t));
@@ -15,7 +15,7 @@ const rid = () => Math.random().toString(36).slice(2, 12);
 const HOUR = 3600000, DAY = 86400000;
 
 // ------------------------------------------------------------------ worker RPC
-const worker = new Worker(new URL("./worker.js?v=3", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./worker.js?v=4", import.meta.url), { type: "module" });
 const pending = new Map();
 let callSeq = 0;
 worker.onmessage = (ev) => {
@@ -51,6 +51,8 @@ const state = {
   var: prefs.var || "obs", scale: prefs.scale || "auto", opacity: prefs.opacity ?? 0.4,
   sel: null, selMarker: null, series: null,
   lastPreset: null, steps: [], stepMode: false, stepIdx: 0, playing: false, stepToken: 0, interval: "day",
+  boundary: prefs.dayBoundary === "local" ? "local" : "12z",   // daily tab: NWS 12Z days or local-midnight days (MRMS)
+  localLatest: null,                                              // end of the latest MRMS hour (local-midnight mode)
   saved: { points: [], areas: [], removedDefaults: [] }, values: { points: [], areas: [] },
   drawing: null, fitted: !!prefs.view, autoTimer: null, lastDeleted: null,
 };
@@ -207,11 +209,22 @@ function downloadBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 // CSVs: plain hyphens instead of en/em dashes, and a UTF-8 byte-order mark so Excel doesn't read
-// the file as Windows-1252 (which turns "–" into "â€“").
+// the file as Windows-1252 (which turns an en dash into "â€“").
+const BOM = String.fromCharCode(0xfeff);
+const LONG_DASHES = new RegExp(`[${String.fromCharCode(0x2013, 0x2014)}]`, "g");
 const downloadText = (text, name, type) => {
-  if (!type || type === "text/csv") text = "﻿" + text.replace(/[–—]/g, "-");
+  if (!type || type === "text/csv") text = BOM + text.replace(LONG_DASHES, "-");
   downloadBlob(new Blob([text], { type: type || "text/csv;charset=utf-8" }), name);
 };
+// "2026-10-05 08:00 EDT" in the viewer's time zone, for CSV columns
+const localStamp = (iso) => {
+  const d = new Date(iso);
+  const tz = d.toLocaleTimeString("en-US", { timeZoneName: "short" }).split(" ").pop();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())} ${tz}`;
+};
+const localDateStr = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const localMidnight = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const MRMS_LOCAL_EARLIEST = "2020-10-15";
 
 // ------------------------------------------------------------------ source tabs + inputs
 function setSource(src) {
@@ -225,6 +238,14 @@ function setSource(src) {
 document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => setSource(b.dataset.src)));
 
 async function refreshS4Latest() {
+  if (state.boundary === "local") {
+    // local-midnight days come from MRMS hourly data; the last day may be partial
+    state.localLatest = new Date(await call("mrmsLatest", ["ms2"]));
+    const last = localDateStr(new Date(+state.localLatest - 1));
+    for (const id of ["s4-start", "s4-end"]) { $(id).min = MRMS_LOCAL_EARLIEST; $(id).max = last; }
+    updateS4Note();
+    return last;
+  }
   const region = $("s4-region").value;
   const latest = await call("s4Latest", [region]);
   state.s4Latest[region] = latest;
@@ -234,7 +255,23 @@ async function refreshS4Latest() {
 }
 
 function s4Preset(p) {
-  const L_ = parseDate(state.s4Latest[$("s4-region").value]);
+  if (state.boundary === "local") {
+    if (!state.localLatest) return;
+    const last = new Date(+state.localLatest - 1);
+    const y = last.getFullYear(), m = last.getMonth(), d = last.getDate();
+    let start = new Date(y, m, d);
+    if (/^\d+$/.test(p)) start = new Date(y, m, d - (Number(p) - 1));
+    else if (p === "mtd") start = new Date(y, m, 1);
+    else if (p === "wytd") start = new Date(m >= 9 ? y : y - 1, 9, 1);
+    else if (p === "ytd") start = new Date(y, 0, 1);
+    $("s4-start").value = localDateStr(start);
+    $("s4-end").value = localDateStr(last);
+    updateS4Note();
+    return;
+  }
+  const latestDay = state.s4Latest[$("s4-region").value];
+  if (!latestDay) return;
+  const L_ = parseDate(latestDay);
   let start = L_;
   if (/^\d+$/.test(p)) start = addDays(L_, -(Number(p) - 1));
   // NWS month / water-year / year-to-date totals start with the day ending 12Z on the 2nd
@@ -250,6 +287,16 @@ function s4Preset(p) {
 function updateS4Note() {
   const s = $("s4-start").value, e = $("s4-end").value;
   if (!s || !e) return;
+  if (state.boundary === "local") {
+    const n = Math.round((localMidnight(e) - localMidnight(s)) / DAY) + 1;
+    const endFull = localMidnight(e); endFull.setDate(endFull.getDate() + 1);
+    const partial = state.localLatest && endFull > state.localLatest;
+    $("s4-note").textContent = n < 1 ? "First day must be on or before the last day." :
+      `${n} day${n > 1 ? "s" : ""}, midnight to midnight local time` +
+      (partial ? ` (the last day so far, through ${localTime(state.localLatest)})` : "") +
+      `. Uses NOAA MRMS multi-sensor (radar + gauge) hourly data summed by local day; normals aren't available. Data from Oct 15, 2020.`;
+    return;
+  }
   const t0 = new Date(addDays(parseDate(s), -1).getTime() + 12 * HOUR);
   const t1 = new Date(parseDate(e).getTime() + 12 * HOUR);
   const n = Math.round((parseDate(e) - parseDate(s)) / DAY) + 1;
@@ -308,6 +355,23 @@ $("s4-region").addEventListener("change", async () => {
 });
 $("mrms-product").addEventListener("change", () => { prefs.product = $("mrms-product").value; savePrefs(); refreshMrmsLatest().catch(() => {}); });
 
+function applyBoundaryUi() {
+  $("day-boundary").value = state.boundary;
+  $("s4-region-wrap").classList.toggle("hidden", state.boundary === "local");   // MRMS covers CONUS only
+}
+$("day-boundary").addEventListener("change", async () => {
+  state.boundary = $("day-boundary").value;
+  prefs.dayBoundary = state.boundary; savePrefs();
+  applyBoundaryUi();
+  setStatus("Checking latest data…");
+  try {
+    await refreshS4Latest();
+    applyPreset("stage4", (state.lastPreset && state.lastPreset.source === "stage4" && state.lastPreset.p) || "7");
+    setStatus("");
+    load();
+  } catch (e) { setStatus(e.message, true); }
+});
+
 // ------------------------------------------------------------------ results
 let resultSeq = 0;
 function makeResult(raw) {
@@ -319,6 +383,18 @@ function makeResult(raw) {
 }
 
 function currentParams() {
+  if (state.source === "stage4" && state.boundary === "local") {
+    // midnight-to-midnight local days: sum MRMS hourly data from local midnight to local midnight
+    const s = $("s4-start").value, e = $("s4-end").value;
+    if (!s || !e) throw new Error("Pick a first and last day.");
+    if (s < MRMS_LOCAL_EARLIEST) throw new Error("Midnight-to-midnight days use MRMS data, which starts Oct 15, 2020. Choose \"12:00 UTC to 12:00 UTC\" for older dates.");
+    const t0 = localMidnight(s);
+    let t1 = localMidnight(e);
+    t1.setDate(t1.getDate() + 1);
+    if (state.localLatest && t1 > state.localLatest) t1 = state.localLatest;      // today so far
+    if (t1 <= t0) throw new Error(`No data yet for that day; the latest hour available ends ${localTime(state.localLatest)}.`);
+    return { source: "mrms", product: "ms2", start: t0.toISOString(), end: t1.toISOString(), prefer: "day", localDays: true };
+  }
   if (state.source === "stage4") {
     const s = $("s4-start").value, e = $("s4-end").value;
     if (!s || !e) throw new Error("Pick a first and last day.");
@@ -332,6 +408,9 @@ function currentParams() {
 let loading = false;
 async function load() {
   if (loading) return false;
+  if (state.source === "stage4" && state.boundary === "local") {
+    try { state.localLatest = new Date(await call("mrmsLatest", ["ms2"])); } catch (_) { /* keep the last known hour */ }
+  }
   let params;
   try { params = currentParams(); } catch (e) { setStatus(e.message, true); return false; }
   loading = true;
@@ -395,7 +474,8 @@ function setMain(r) {
   $("display-card").classList.remove("hidden");
   if (m.source === "mrms") {
     $("res-title").textContent = `${localTime(new Date(m.start_utc))} – ${localTime(new Date(m.end_utc))} (${m.n_steps} h)`;
-    $("res-product").textContent = `${m.product} · ${m.resolution} · ${m.label}`;
+    $("res-product").textContent = `${m.product} · ${m.resolution} · ${m.label}` +
+      (m.local_days ? " · days run midnight to midnight, local time" : "");
   } else {
     $("res-title").textContent = m.label;
     $("res-product").textContent = `${m.product} · ${m.resolution} · days end 12:00 UTC`;
@@ -934,11 +1014,12 @@ $("csv-btn").addEventListener("click", () => {
   const where = s.kind === "point" ? `point lat,lon = ${s.lat.toFixed(5)},${s.lon.toFixed(5)}` : `area average over "${selName()}"`;
   const { bins, vals, interval } = state.series;
   const lines = [`# ${m.product}`, `# ${m.label}`, `# ${state.series.name}: ${where}`,
-    `# precipitation in inches per ${interval}; values include only the data available (complete = no)`,
-    "period,period_start_utc,period_end_utc,precip_in,cumulative_in,complete,missing_data",
+    `# precipitation in inches per ${interval}${m.source === "stage4" ? " (days end 12:00 UTC)" : m.local_days ? " (days run midnight to midnight local time)" : ""}; values include only the data available (complete = no)`,
+    "period,period_start_local,period_end_local,period_start_utc,period_end_utc,precip_in,cumulative_in,complete,missing_data",
     ...vals.map(({ v, m: miss }, i) => {
       cum += v || 0;
-      return [csvCell(bins[i].label + (bins[i].partial ? " (partial period)" : "")), bins[i].start_utc, bins[i].end_utc,
+      return [csvCell(bins[i].label + (bins[i].partial ? " (partial period)" : "")),
+        localStamp(bins[i].start_utc), localStamp(bins[i].end_utc), bins[i].start_utc, bins[i].end_utc,
         v == null ? "" : v.toFixed(3), cum.toFixed(3), miss.length ? "no" : "yes", csvCell(miss.join("; "))].join(",");
     })];
   const tag = s.kind === "point" ? `${s.lat.toFixed(4)}_${s.lon.toFixed(4)}` : selName().replace(/[^\w-]+/g, "_");
@@ -1189,6 +1270,7 @@ $("export-values").addEventListener("click", async () => {
     }
     const f = (x, n = 3) => (x == null || !Number.isFinite(x) ? "" : x.toFixed(n));
     const lines = [`# ${d.meta.product}`, `# ${periodLabel(d)}${d.meta.source === "stage4" ? " (days end 12:00 UTC)" : ""}`,
+      `# period: ${localStamp(d.meta.start_utc)} to ${localStamp(d.meta.end_utc)} (UTC ${d.meta.start_utc.slice(0, 16)} to ${d.meta.end_utc.slice(0, 16)})`,
       "# values include only the data available; complete = no means some days/hours had no data (listed in missing_data)",
       ["type", "name", "lat", "lon", "area_km2", "precip_in", "max_in", "min_in", ...(hasN ? ["normal_in", "departure_in", "pct_of_normal"] : []), "complete", "missing_data"].join(",")];
     const tail = (id, has) => [has ? (missing.has(id) ? "no" : "yes") : "", csvCell((missing.get(id) || []).join("; "))];
@@ -1223,14 +1305,14 @@ $("export-breakdown").addEventListener("click", async () => {
     const names = [...pts.map((p) => p.name), ...ars.map((a) => `${a.name} (area avg)`)];
     const series = [...j.points, ...j.areas];
     const lines = [`# ${m.product}`, `# ${m.label}`,
-      `# precipitation in inches per ${j.interval}${m.source === "stage4" ? " (days end 12:00 UTC)" : ""}; values include only the data available; missing_data lists what had no data`,
-      ["period", "period_start_utc", "period_end_utc", ...names.map(csvCell), "missing_data"].join(",")];
+      `# precipitation in inches per ${j.interval}${m.source === "stage4" ? " (days end 12:00 UTC)" : m.local_days ? " (days run midnight to midnight local time)" : ""}; values include only the data available; missing_data lists what had no data`,
+      ["period", "period_start_local", "period_end_local", "period_start_utc", "period_end_utc", ...names.map(csvCell), "missing_data"].join(",")];
     j.bins.forEach((b, i) => {
       const notes = series.map((s, k) => (s[i].m.length ? `${names[k]}: ${s[i].m.join(", ")}` : null)).filter(Boolean);
-      lines.push([csvCell(b.label + (b.partial ? " (partial period)" : "")), b.start_utc, b.end_utc,
+      lines.push([csvCell(b.label + (b.partial ? " (partial period)" : "")), localStamp(b.start_utc), localStamp(b.end_utc), b.start_utc, b.end_utc,
         ...series.map((s) => (s[i].v == null ? "" : s[i].v.toFixed(3))), csvCell(notes.join(" | "))].join(","));
     });
-    lines.push(["TOTAL", "", "", ...series.map((s) => s.reduce((a, x) => a + (x.v || 0), 0).toFixed(3)), ""].join(","));
+    lines.push(["TOTAL", "", "", "", "", ...series.map((s) => s.reduce((a, x) => a + (x.v || 0), 0).toFixed(3)), ""].join(","));
     downloadText(lines.join("\r\n"), `saved_breakdown_${m.source}_${j.interval}.csv`);
   } catch (e) {
     setStatus(e.message, true);
@@ -1455,6 +1537,7 @@ window.addEventListener("resize", () => map.invalidateSize());
     $("show-saved").checked = prefs.showSaved !== false;
     $("auto-refresh").value = String(prefs.autoRefresh || 0);
     setAutoRefresh(Number(prefs.autoRefresh || 0));
+    applyBoundaryUi();
     loadSaved();
 
     setStatus("Checking latest data…");
