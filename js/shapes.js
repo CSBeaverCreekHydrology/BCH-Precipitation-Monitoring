@@ -1,6 +1,6 @@
 // Polygon import for saved areas: zipped shapefile (.shp/.dbf/.prj, any projection via proj4js) or GeoJSON.
-import { unzip } from "./decoders.js?v=4";
-import { polygonAreaKm2 } from "./grid.js?v=4";
+import { unzip } from "./decoders.js?v=5";
+import { polygonAreaKm2 } from "./grid.js?v=5";
 
 const PROJ4_URL = "https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.11.0/proj4.js";
 let proj4Promise = null;

@@ -3,10 +3,10 @@
 import {
   cellIndex, gridBounds, legendFor, colorOf, autoScale, autoDepScale, areaStats, areaMask,
   labelPoint, polygonAreaKm2, geoTagsFor, colRow, VAR_LABELS, areaHasPartial,
-} from "./grid.js?v=4";
-import { writeGeoTiff } from "./decoders.js?v=4";
-import { importAreas } from "./shapes.js?v=4";
-import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=4";
+} from "./grid.js?v=5";
+import { writeGeoTiff } from "./decoders.js?v=5";
+import { importAreas } from "./shapes.js?v=5";
+import { makeBins, intervalsFor, defaultInterval, INTERVAL_LABELS } from "./bins.js?v=5";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (t) => new Promise((r) => setTimeout(r, t));
@@ -15,7 +15,7 @@ const rid = () => Math.random().toString(36).slice(2, 12);
 const HOUR = 3600000, DAY = 86400000;
 
 // ------------------------------------------------------------------ worker RPC
-const worker = new Worker(new URL("./worker.js?v=4", import.meta.url), { type: "module" });
+const worker = new Worker(new URL("./worker.js?v=5", import.meta.url), { type: "module" });
 const pending = new Map();
 let callSeq = 0;
 worker.onmessage = (ev) => {
@@ -358,6 +358,8 @@ $("mrms-product").addEventListener("change", () => { prefs.product = $("mrms-pro
 function applyBoundaryUi() {
   $("day-boundary").value = state.boundary;
   $("s4-region-wrap").classList.toggle("hidden", state.boundary === "local");   // MRMS covers CONUS only
+  // the Daily tab's subtitle names the data behind the current day setting
+  $("daily-sub").textContent = state.boundary === "local" ? "MRMS · midnight days · Oct 2020–now" : "Stage IV · 12Z days · 2016–now";
 }
 $("day-boundary").addEventListener("change", async () => {
   state.boundary = $("day-boundary").value;

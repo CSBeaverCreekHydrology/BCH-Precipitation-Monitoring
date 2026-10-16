@@ -9,9 +9,9 @@
 // Missing data: totals add up whatever is available. For every grid cell `miss` counts the files
 // (days / hour blocks) with no value there; the page marks those totals with an asterisk.
 
-import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=4";
-import { Sampler, sameGrid, gridKey } from "./grid.js?v=4";
-import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=4";
+import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=5";
+import { Sampler, sameGrid, gridKey } from "./grid.js?v=5";
+import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=5";
 
 export const S4_BASE = "https://water.noaa.gov/resources/downloads/precip/stageIV";
 export const MRMS_BASE = "https://noaa-mrms-pds.s3.amazonaws.com";
