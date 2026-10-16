@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#1f6feb">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4C24 18 12 30 12 42a20 20 0 0 0 40 0C52 30 40 18 32 4z' fill='%231f6feb'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="css/style.css?v=5">
+<link rel="stylesheet" href="css/style.css?v=6">
 </head>
 <body>
 <aside id="panel">
@@ -28,9 +28,25 @@
 
   <section class="card">
     <div class="tabs" role="tablist">
-      <button class="tab active" data-src="stage4" role="tab">Daily<span id="daily-sub">Stage IV · 12Z days · 2016–now</span></button>
-      <button class="tab" data-src="mrms" role="tab">Hourly<span>MRMS · Oct 2020–now</span></button>
+      <button class="tab active" data-src="stage4" role="tab">Daily<span id="daily-sub">Stage IV · 12Z · 2016+</span></button>
+      <button class="tab" data-src="mrms" role="tab">Hourly<span>MRMS · hourly · 2020+</span></button>
     </div>
+    <details class="compare">
+      <summary>Stage IV or MRMS? Which to use</summary>
+      <dl>
+        <dt>Stage IV <span class="muted">(Daily tab)</span></dt>
+        <dd>NWS River Forecast Center totals from radar + rain gauges, checked by forecasters. 4 km grid,
+          24-h days ending 12Z (8 AM EDT / 7 AM EST), 2016 on, includes normals.
+          <b>Best for</b> official daily and monthly totals, long records and % of normal.
+          <b>Limits:</b> coarser grid, fixed 12Z days, newest day posted mid-morning.</dd>
+        <dt>MRMS <span class="muted">(Hourly tab, or Daily with midnight days)</span></dt>
+        <dd>NOAA's automated national radar mosaic, adjusted to rain gauges (multi-sensor). 1 km grid,
+          hourly, Oct 2020 on, any start time including midnight-to-midnight days.
+          <b>Best for</b> storm timing and intensity, small watersheds and the last few hours.
+          <b>Limits:</b> no human review, so radar errors (mountains, far from a radar, snow) can slip through; no normals; continental US only.</dd>
+      </dl>
+      <p class="note">The two can give somewhat different totals for the same place and period.</p>
+    </details>
 
     <div id="src-stage4" class="src-panel">
       <label>Days run
@@ -227,6 +243,6 @@
 <div id="hover" class="hover hidden"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script type="module" src="js/app.js?v=5"></script>
+<script type="module" src="js/app.js?v=6"></script>
 </body>
 </html>
