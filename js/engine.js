@@ -9,9 +9,9 @@
 // Missing data: totals add up whatever is available. For every grid cell `miss` counts the files
 // (days / hour blocks) with no value there; the page marks those totals with an asterisk.
 
-import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=6";
-import { Sampler, sameGrid, gridKey } from "./grid.js?v=6";
-import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=6";
+import { readTiff, decodeGrib1, decodeGrib2, inflate, untar, isGzip } from "./decoders.js?v=7";
+import { Sampler, sameGrid, gridKey } from "./grid.js?v=7";
+import { makeBins, fmtDay, fmtLocal } from "./bins.js?v=7";
 
 export const S4_BASE = "https://water.noaa.gov/resources/downloads/precip/stageIV";
 export const MRMS_BASE = "https://noaa-mrms-pds.s3.amazonaws.com";
@@ -53,6 +53,7 @@ export function refresh() {
   refreshMark = Date.now();
   listings.clear();
   latestCache.clear();
+  emptyFiles.clear();
   for (const [k, v] of grids) if (v.recent) { gridBytes -= v.bytes; grids.delete(k); }
 }
 
@@ -117,14 +118,21 @@ async function pool(items, limit, fn) {
 const grids = new Map();
 let gridBytes = 0;
 const GRID_CACHE_BYTES = 320e6;
+const RECENT_TTL = 10 * 60000;        // recent (provisional) files are re-checked this often: NWS re-posts them
 function cacheGet(key) {
   const v = grids.get(key);
-  if (v) { grids.delete(key); grids.set(key, v); }
+  if (!v) return v;
+  grids.delete(key);
+  if (v.recent && Date.now() - v.t > RECENT_TTL) { gridBytes -= v.bytes; return undefined; }
+  grids.set(key, v);
   return v;
 }
+const countValid = (a) => { let n = 0; for (let i = 0; i < a.length; i++) if (a[i] >= 0) n++; return n; };
 function cachePut(key, v, recent) {
   v.bytes = v.obs.byteLength + (v.normal ? v.normal.byteLength : 0);
   v.recent = recent;
+  v.t = Date.now();
+  v.valid = countValid(v.obs);       // 0 = NWS posted the file without any data
   grids.set(key, v);
   gridBytes += v.bytes;
   for (const [k, old] of grids) {
@@ -168,18 +176,42 @@ function latestGet(key, ttl) {
 }
 const latestSet = (key, v) => { latestCache.set(key, { t: Date.now(), v }); return v; };
 
+// NWS sometimes posts a day's files with every cell set to "no data" (e.g. Oct 23, 2026) and fixes
+// them later. Those files are remembered here for a few minutes so plans route around them.
+const emptyFiles = new Map();        // file name -> time found empty
+const isEmptyFile = (f) => emptyFiles.has(f) && Date.now() - emptyFiles.get(f) < RECENT_TTL;
+const skippedDays = new Map();       // region -> newest days skipped because their files had no data
+// Cells with data in a complete NWS mosaic (every RFC reported). The newest day is sometimes posted
+// before all River Forecast Centers report; NWS's multi-day files then have the same hole.
+const FULL_VALID = { conus: 590556, ak: 243800, pr: 42025 };
+const fullValid = new Map();
+const expectedValid = (region) => Math.max(FULL_VALID[region] || 0, fullValid.get(region) || 0);
+const latestValid = new Map();       // region -> data cells in the newest day's file
+
+/** Newest day whose 1-day file is posted AND contains data. */
 export async function s4Latest(region) {
-  const cached = latestGet(region, 10 * 60000);
+  const cached = latestGet(region, RECENT_TTL);
   if (cached) return cached;
   const today = todayUtc();
+  const skipped = [];
   for (let back = 0; back < 8; back++) {
     const d = new Date(today - back * DAY);
-    if ((await s4Listing(d)).has(`nws_precip_1day_${ymd(d)}_${region}.tif`)) return latestSet(region, isoDay(d));
+    if (!(await s4Listing(d)).has(`nws_precip_1day_${ymd(d)}_${region}.tif`)) continue;
+    let g = null;
+    try { g = await s4Day(d, region, true); } catch (_) { g = null; }
+    if (g && g.valid > 0) {
+      skippedDays.set(region, skipped);
+      latestValid.set(region, g.valid);
+      return latestSet(region, isoDay(d));
+    }
+    skipped.push(d);                  // posted but empty (or unreadable): look at the day before
   }
   throw new Error("Could not reach the NWS Stage IV archive (water.noaa.gov). Check the internet connection and press Refresh.");
 }
 
 async function windowCandidates(d, region) {
+  // when one multi-day file for a date came back empty, NWS's others for that date are too
+  if (isEmptyFile(`windows:${isoDay(d)}:${region}`)) return [];
   const names = await s4Listing(d);
   const out = S4_LASTN.map((n) => [`nws_precip_last${n}days_${ymd(d)}_${region}.tif`, n]);
   // NWS month / water-year / year-to-date files start with the day ending 12Z on the 2nd
@@ -189,7 +221,7 @@ async function windowCandidates(d, region) {
   if (d >= wy) out.push([`nws_precip_wytd_${ymd(d)}_${region}.tif`, Math.round((d - wy) / DAY) + 1]);
   const jan = new Date(Date.UTC(y, 0, 2));
   if (d >= jan) out.push([`nws_precip_ytd_${ymd(d)}_${region}.tif`, Math.round((d - jan) / DAY) + 1]);
-  return out.filter(([f]) => names.has(f));
+  return out.filter(([f]) => names.has(f) && !isEmptyFile(f));
 }
 
 /** Fewest files covering [start, end] (inclusive end dates): pre-summed windows where published, else days. */
@@ -224,7 +256,8 @@ async function s4Tif(d, fname, region) {
   if (hit) return hit;
   return once(key, async () => {
     const recent = s4Recent(d);
-    const bytes = await getBytes(s4Dir(d) + fname, { immutable: !recent, revalidate: recent && refreshMark > 0 });
+    // recent files are provisional and sometimes re-posted, so always revalidate them with the server
+    const bytes = await getBytes(s4Dir(d) + fname, { immutable: !recent, revalidate: recent });
     if (!bytes) return null;
     const t = await readTiff(bytes, [0, 1]);
     return cachePut(key, { grid: gridFromTiff(t, region), obs: cleanNeg(t.bands[0]), normal: cleanNeg(t.bands[1]), src: "tif" }, recent);
@@ -237,7 +270,7 @@ async function s4Tar(d, region) {
   if (hit) return hit;
   return once(key, async () => {
     const recent = s4Recent(d);
-    const bytes = await getBytes(`${s4Dir(d)}ncep_stage_iv_source_files_${ymd(d)}.tar`, { immutable: !recent, revalidate: recent && refreshMark > 0 });
+    const bytes = await getBytes(`${s4Dir(d)}ncep_stage_iv_source_files_${ymd(d)}.tar`, { immutable: !recent, revalidate: recent });
     if (!bytes) return null;
     const member = untar(bytes).find((f) => new RegExp(`(^|/)${region}_\\d{8}_24h\\.grb2?(\\.gz)?$`).test(f.name));
     if (!member) return null;
@@ -259,26 +292,49 @@ async function s4Day(d, region, preferTif) {
   const names = await s4Listing(d);
   let order = preferTif || cacheGet(`s4tif:${tif}`) ? ["tif", "tar"] : ["tar", "tif"];
   order = order.filter((k) => names.has(k === "tif" ? tif : tar));
-  let lastErr = null;
+  let lastErr = null, empty = null;
   for (const k of order) {
     try {
       const g = k === "tif" ? await s4Tif(d, tif, region) : await s4Tar(d, region);
-      if (g) return g;
+      if (g && g.valid > 0) return g;
+      if (g) empty = g;               // posted without data: try the other file for that day
     } catch (e) {
       lastErr = e;
     }
   }
+  if (empty) return empty;
   if (lastErr) throw lastErr;
   return null;
 }
 
+/** One planned file, or null when it is missing, unreadable, or was posted without data. */
 async function s4LoadPart(pt, region, preferTif) {
   try {
     const g = pt.kind === "window" ? await s4Tif(pt.d, pt.fname, region) : await s4Day(pt.d, region, preferTif);
-    return g && sameGrid(g.grid, REGIONS[region].grid) ? g : null;
+    if (g && pt.kind === "window" && !g.valid) emptyFiles.set(pt.fname, Date.now());
+    return g && g.valid > 0 && sameGrid(g.grid, REGIONS[region].grid) ? g : null;
   } catch (_) {
     return null;
   }
+}
+
+/** Grids for one planned part: [{g, label, file}]. If a pre-summed window file is missing or empty,
+ *  its period is re-planned without it (e.g. yesterday's window + the single day), so one bad
+ *  NWS file doesn't blank a whole multi-day total. */
+async function s4PartGrids(pt, region, preferTif) {
+  const g = await s4LoadPart(pt, region, preferTif);
+  const file = (gg) => `${pt.fname || `1day (${gg ? gg.src : "missing"})`} @ ${isoDay(pt.d)}`;
+  if (g) fullValid.set(region, Math.max(fullValid.get(region) || 0, g.valid));
+  // A multi-day file ending on the newest day while some RFCs haven't reported is blank there for the
+  // WHOLE period; rebuild it as (window ending the day before) + (newest day) so only that day is missing.
+  const partialNewest = g && pt.kind === "window" && pt.d >= parseDay(await s4Latest(region)) &&
+    g.valid < expectedValid(region) * 0.995;
+  if ((g && !partialNewest) || pt.kind !== "window") return [{ g, label: s4PartLabel(pt), file: file(g) }];
+  emptyFiles.set(pt.fname, Date.now());
+  emptyFiles.set(`windows:${isoDay(pt.d)}:${region}`, Date.now());
+  const out = [];
+  for (const sub of await s4Plan(new Date(+pt.d - (pt.n - 1) * DAY), pt.d, region)) out.push(...await s4PartGrids(sub, region, preferTif));
+  return out;
 }
 
 /** Running sum that tolerates missing files and missing cells. */
@@ -320,7 +376,7 @@ function missingWarnings(acc, done, unit) {
   const w = [];
   if (acc.missingParts.length) {
     const list = acc.missingParts.slice(0, 8).join("; ") + (acc.missingParts.length > 8 ? `; +${acc.missingParts.length - 8} more` : "");
-    w.push(`* Some ${unit} are missing from the archive, so totals include only the data available. Missing: ${list}.`);
+    w.push(`* Some ${unit} are missing from the archive or were posted without data, so totals include only the data available. Missing: ${list}.`);
   }
   if (done.partialCells) w.push(`* At some locations a few ${unit} have no data (for example radar or gauge outages). Those totals are marked with *; click a location to see which ${unit}.`);
   return w;
@@ -332,23 +388,32 @@ export async function computeStage4(p, progress) {
   const latest = parseDay(await s4Latest(p.region));
   if (start > end) throw new UserError("First day is after last day.");
   if (start < parseDay(S4_EARLIEST)) throw new UserError("The Stage IV archive starts Jan 1, 2016.");
-  if (end > latest) throw new UserError(`Latest available day is ${isoDay(latest)}.`);
+  const skipped = (skippedDays.get(p.region) || []).filter((d) => d > latest);
+  const skipNote = skipped.length
+    ? `NWS posted ${skipped.map(fmtDay).join(", ")} without any data, so the newest day available is ${fmtDay(latest)}. If NWS re-posts it, press Refresh to pick it up.`
+    : null;
+  if (end > latest) throw new UserError(skipNote || `Latest available day is ${isoDay(latest)}.`);
   const ndays = Math.round((end - start) / DAY) + 1;
   progress({ done: 0, total: 1, message: "Planning downloads…" });
   const parts = await s4Plan(start, end, p.region);
   const preferTif = ndays <= S4_DAILY_TIF_MAX;
   const acc = new Accumulator(REGIONS[p.region].grid, true);
   let done = 0;
-  const srcs = [];
+  const files = [];
   await pool(parts, 6, async (pt, i) => {
-    const g = await s4LoadPart(pt, p.region, preferTif);
-    if (g) acc.add(g); else acc.missing(s4PartLabel(pt));            // summed as it arrives: no long-range memory build-up
-    srcs[i] = g ? g.src : "missing";
+    const pieces = await s4PartGrids(pt, p.region, preferTif);
+    for (const { g, label } of pieces) { if (g) acc.add(g); else acc.missing(label); }   // summed as it arrives: no long-range memory build-up
+    files[i] = pieces.map((x) => x.file);
     progress({ done: ++done, total: parts.length, message: `Downloaded ${done} of ${parts.length} file(s)` });
   });
-  if (acc.missingParts.length === parts.length) throw new UserError("No Stage IV data was found for that range.");
+  if (acc.missingParts.length === acc.parts) throw new UserError("No Stage IV data was found for that range.");
   const r = acc.finish();
   const warnings = missingWarnings(acc, r, "days");
+  if (skipNote && end >= latest) warnings.unshift(skipNote);
+  if (end >= latest && (latestValid.get(p.region) || 0) < expectedValid(p.region) * 0.995) {
+    warnings.unshift(`NWS's newest day (${fmtDay(latest)}) is still incomplete: some River Forecast Centers haven't reported yet. ` +
+      "Totals there include only the earlier days and are marked *. Press Refresh later to pick up the rest.");
+  }
   if (!acc.hasNormals) warnings.push("Normals are unavailable for part of this range (archive GRIB files), so departure and % of normal are off.");
   return {
     meta: {
@@ -357,7 +422,7 @@ export async function computeStage4(p, progress) {
       start: p.start, end: p.end, start_utc: new Date(+start - DAY + 12 * HOUR).toISOString(), end_utc: new Date(+end + 12 * HOUR).toISOString(),
       n_steps: ndays, step: "day", has_normals: acc.hasNormals, resolution: "4.76 km HRAP grid", warnings,
       n_parts: r.nParts, missing: acc.missingParts,
-      files: parts.map((pt, i) => `${pt.fname || `1day (${srcs[i]})`} @ ${isoDay(pt.d)}`),
+      files: files.flat(),
       computed_utc: new Date().toISOString(),
     },
     grid: acc.grid, obs: r.obs, normal: r.normal, miss: r.miss,
@@ -507,8 +572,7 @@ export async function series(meta, points, areas, interval, progress) {
     }
     total = jobs.length;
     await pool(jobs, 6, async ({ bi, pt }) => {
-      const g = await s4LoadPart(pt, meta.region, false);
-      take(bi, g, s4PartLabel(pt));
+      for (const { g, label } of await s4PartGrids(pt, meta.region, false)) take(bi, g, label);
       tick();
     });
   } else {

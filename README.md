@@ -76,7 +76,7 @@ git push -u origin main
 
 **Updating:** edit or re-upload files and commit. GitHub Pages republishes within a minute or two.
 Browsers may keep the old version for up to 10 minutes. After changing any file in `css/` or `js/`,
-search-and-replace `?v=6` with the next number (`?v=7`, …) in `index.html` and all `js/*.js`
+search-and-replace `?v=7` with the next number (`?v=8`, …) in `index.html` and all `js/*.js`
 files. That makes everyone load the new copies together.
 
 ## Test locally

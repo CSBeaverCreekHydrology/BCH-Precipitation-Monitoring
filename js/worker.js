@@ -1,5 +1,5 @@
 // Web Worker: runs the download/decode/accumulate engine off the main thread.
-import { api, UserError } from "./engine.js?v=6";
+import { api, UserError } from "./engine.js?v=7";
 
 self.onmessage = async (ev) => {
   const { id, fn, args } = ev.data;
